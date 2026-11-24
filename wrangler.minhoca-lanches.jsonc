@@ -1,0 +1,23 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "minhoca-lanches",
+  "main": "worker/index.ts",
+  "compatibility_date": "2026-11-23",
+  "upload_source_maps": true,
+  "observability": { "enabled": true },
+  "vars": { "CANONICAL_STORE_URL": "https://tem-o-que.keizernavier.workers.dev/s/minhoca-lanches" },
+  "assets": {
+    "directory": "./dist",
+    "binding": "ASSETS",
+    "not_found_handling": "single-page-application",
+    "run_worker_first": ["/*"]
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "minhoca-lanches-db",
+      "database_id": "839f1502-abf0-46cb-8d45-7405e23ee7f0",
+      "migrations_dir": "./migrations"
+    }
+  ]
+}

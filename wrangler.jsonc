@@ -1,0 +1,22 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "tem-o-que",
+  "main": "worker/index.ts",
+  "compatibility_date": "2026-11-23",
+  "upload_source_maps": true,
+  "observability": { "enabled": true },
+  "assets": {
+    "directory": "./dist",
+    "binding": "ASSETS",
+    "not_found_handling": "single-page-application",
+    "run_worker_first": ["/api/*", "/s/*"]
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "marlene-interprise-db",
+      "database_id": "8d995574-8e1e-453a-9c53-1e1bb58d4b69",
+      "migrations_dir": "./migrations"
+    }
+  ]
+}
