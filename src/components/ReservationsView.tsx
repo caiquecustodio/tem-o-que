@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { MessageCircle, RefreshCw } from 'lucide-react';
 import type { Order, OrderStatus, Product, ProductionRow, ReservationOffer } from '../types';
-import { api } from '../api/client';
+import { api, getStorePathPrefix } from '../api/client';
 import { formatBRL, formatDateTime } from '../utils/format';
 
 type Tab = 'orders' | 'offers' | 'production';
@@ -37,6 +37,9 @@ export function ReservationsView({ products, onDataChanged }: ReservationsViewPr
   const [offerDate, setOfferDate] = useState('');
   const [offerLimit, setOfferLimit] = useState('');
   const [offerCloses, setOfferCloses] = useState('');
+  const [linkCopied, setLinkCopied] = useState(false);
+  const publicLink = `${window.location.origin}${getStorePathPrefix()}/pedido`;
+  const copyPublicLink = async () => { try { await navigator.clipboard.writeText(publicLink); setLinkCopied(true); window.setTimeout(() => setLinkCopied(false), 2500); } catch { setError('Não foi possível copiar. Selecione o link e copie manualmente.'); } };
 
   const load = useCallback(async (silent = false) => {
     if (!silent) setLoading(true);
@@ -80,6 +83,11 @@ export function ReservationsView({ products, onDataChanged }: ReservationsViewPr
           ))}
         </div>
         <button onClick={() => void load()} className={secondaryButton}><RefreshCw className="mr-2 h-4 w-4" />Atualizar</button>
+      </div>
+
+      <div className="flex flex-wrap items-center justify-between gap-2 rounded-2xl border border-emerald-200 bg-emerald-50/60 p-3.5">
+        <p className="min-w-0 text-sm text-slate-700">Página para os clientes reservarem: <a href={publicLink} target="_blank" rel="noreferrer" className="break-all font-mono text-xs font-semibold text-emerald-800 underline">{publicLink}</a></p>
+        <button onClick={() => void copyPublicLink()} className={secondaryButton}>{linkCopied ? 'Link copiado' : 'Copiar link'}</button>
       </div>
 
       {error && <p role="alert" className="rounded-xl bg-red-50 p-3 text-sm text-red-800">{error}</p>}

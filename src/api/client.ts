@@ -48,7 +48,7 @@ export interface BootstrapData {
 }
 export type BootstrapResponse = BootstrapData | { unchanged: true; version: number | null };
 
-async function request<T>(url: string, options?: RequestInit): Promise<T> {
+export async function request<T>(url: string, options?: RequestInit): Promise<T> {
   const targetUrl = url.startsWith('/api/') ? apiUrl(url) : url;
   const res = await fetch(targetUrl, {
     headers: {
@@ -177,5 +177,6 @@ export const api = {
     billing_message_template: string;
     brand_primary_color: string;
     brand_secondary_color: string;
+    whatsapp_phone?: string;
   }) => request<StoreSettings>('/api/settings', { method: 'PUT', body: JSON.stringify(payload) }),
 };

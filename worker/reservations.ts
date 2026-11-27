@@ -257,7 +257,7 @@ export async function handleReservationsPublic(ctx: PublicContext): Promise<Resp
       if (line.offerId) {
         const offer = await first<Row>(db, `SELECT ro.*,(${RESERVED_SQL}) reserved_qty FROM reservation_offers ro WHERE ro.id=?`, line.offerId);
         if (!offer || offer.status !== 'open' || Number(offer.product_id) !== line.productId || (offer.closes_at && String(offer.closes_at) <= stamp)) return err(`A reserva de "${product.name}" não está mais aberta.`, 409);
-        if (offer.limit_qty !== null && Number(offer.reserved_qty) + line.quantity > Number(offer.limit_qty)) return err(`Restam apenas ${Math.max(0, Number(offer.limit_qty) - Number(offer.reserved_qty))} porções de "${product.name}".`, 409);
+        if (offer.limit_qty !== null && Number(offer.reserved_qty) + line.quantity > Number(offer.limit_qty)) { const left = Math.max(0, Number(offer.limit_qty) - Number(offer.reserved_qty)); return err(`${left === 1 ? 'Resta apenas 1 porção' : `Restam apenas ${left} porções`} de "${product.name}".`, 409); }
       } else if (Number(product.stock) < line.quantity) {
         return err(`Estoque insuficiente de "${product.name}" (disponível: ${Math.max(0, Number(product.stock))}).`, 409);
       }

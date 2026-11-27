@@ -73,6 +73,7 @@ export function SettingsView({ settings, loyaltySettings, products, onSettingsUp
   const [pixKeyType, setPixKeyType] = useState<PixKeyType>(settings?.pix_key_type || 'auto');
   const [beneficiaryName, setBeneficiaryName] = useState(settings?.pix_beneficiary_name || 'MARLENE INTERPRISE');
   const [city, setCity] = useState(settings?.pix_city || 'SAO PAULO');
+  const [whatsappPhone, setWhatsappPhone] = useState(settings?.whatsapp_phone || '');
   const [template, setTemplate] = useState(settings?.billing_message_template || DEFAULT_BILLING_TEMPLATE);
   const [brandPrimaryColor, setBrandPrimaryColor] = useState(settings?.brand_primary_color || '#047857');
   const [brandSecondaryColor, setBrandSecondaryColor] = useState(settings?.brand_secondary_color || '#f59e0b');
@@ -99,6 +100,7 @@ export function SettingsView({ settings, loyaltySettings, products, onSettingsUp
       setPixKeyType(settings.pix_key_type || 'auto');
       setBeneficiaryName(settings.pix_beneficiary_name || 'MARLENE INTERPRISE');
       setCity(settings.pix_city || 'SAO PAULO');
+      setWhatsappPhone(settings.whatsapp_phone || '');
       setTemplate(settings.billing_message_template || DEFAULT_BILLING_TEMPLATE);
       setBrandPrimaryColor(settings.brand_primary_color || '#047857');
       setBrandSecondaryColor(settings.brand_secondary_color || '#f59e0b');
@@ -132,12 +134,13 @@ export function SettingsView({ settings, loyaltySettings, products, onSettingsUp
       pix_key_type: pixKeyType,
       pix_beneficiary_name: beneficiaryName.trim() || 'MARLENE INTERPRISE',
       pix_city: city.trim() || 'SAO PAULO',
+      whatsapp_phone: whatsappPhone,
       billing_message_template: template,
       brand_primary_color: brandPrimaryColor,
       brand_secondary_color: brandSecondaryColor,
       updated_at: new Date().toISOString(),
     }),
-    [storeName, logoDataUrl, pixKey, pixKeyType, beneficiaryName, city, template, brandPrimaryColor, brandSecondaryColor]
+    [storeName, logoDataUrl, pixKey, pixKeyType, beneficiaryName, city, whatsappPhone, template, brandPrimaryColor, brandSecondaryColor]
   );
 
   const sampleMessage = useMemo(
@@ -200,6 +203,7 @@ export function SettingsView({ settings, loyaltySettings, products, onSettingsUp
         pix_key_type: pixKeyType,
         pix_beneficiary_name: beneficiaryName.trim() || 'MARLENE INTERPRISE',
         pix_city: city.trim() || 'SAO PAULO',
+        whatsapp_phone: whatsappPhone,
         billing_message_template: template,
         brand_primary_color: brandPrimaryColor,
         brand_secondary_color: brandSecondaryColor,
@@ -439,6 +443,20 @@ export function SettingsView({ settings, loyaltySettings, products, onSettingsUp
                 <span className="font-mono font-semibold text-slate-800">{normalizedKey}</span>
               </p>
             )}
+
+            <div>
+              <label htmlFor="store-whatsapp" className="block text-xs font-semibold text-slate-700 mb-1">WhatsApp da loja (com DDD)</label>
+              <input
+                id="store-whatsapp"
+                type="tel"
+                inputMode="numeric"
+                value={whatsappPhone}
+                onChange={(e) => setWhatsappPhone(e.target.value)}
+                placeholder="81999990000"
+                className="w-full px-3 py-2.5 text-sm font-mono border border-slate-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-emerald-600/20 focus:border-emerald-600"
+              />
+              <p className="mt-1 text-xs text-slate-500">Usado no botão "Enviar comprovante" da página de pedidos.</p>
+            </div>
 
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-3.5">
               <div>
