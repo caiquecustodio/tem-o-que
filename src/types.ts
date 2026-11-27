@@ -15,6 +15,7 @@ export interface StoreSettings {
   billing_message_template: string;
   brand_primary_color: string;
   brand_secondary_color: string;
+  whatsapp_phone?: string;
   updated_at: string;
 }
 
@@ -175,6 +176,7 @@ export interface DashboardSummary {
   top_products: TopProductMetric[];
   recent_sales: Sale[];
   recent_payments: Payment[];
+  pending_orders?: number;
 }
 
 export interface PeriodClosure {

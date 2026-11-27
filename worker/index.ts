@@ -1,15 +1,19 @@
+import { handleReservationsAdmin, handleReservationsPublic } from './reservations';
+import type { Deps as ReservationDeps } from './reservations';
+
 type Env = Cloudflare.Env;
 type Row = Record<string, unknown>;
 type SaleRow = Row & { items: Row[] };
 
 declare global {
-  namespace Cloudflare { interface Env { LOGIN_USERNAME?: string; LOGIN_PASSWORD: string; SESSION_SECRET: string; PLATFORM_ADMIN_PASSWORD?: string; CANONICAL_STORE_URL?: string } }
+  namespace Cloudflare { interface Env { LOGIN_USERNAME?: string; LOGIN_PASSWORD: string; SESSION_SECRET: string; PLATFORM_ADMIN_PASSWORD?: string; CANONICAL_STORE_URL?: string; TURNSTILE_SECRET?: string; TURNSTILE_SITE_KEY?: string } }
 }
 
 const now = () => new Date().toISOString();
 const json = (value: unknown, status = 200) => Response.json(value, { status, headers: { 'Cache-Control': 'private, no-store' } });
 const err = (message: string, status = 400) => json({ error: message }, status);
-const STORE_TABLES = ['products','price_history','employees','sales','sale_items','payments','stock_movements','period_closures','store_settings','loyalty_settings','auth_credentials'];
+const STORE_TABLES = ['products','price_history','employees','sales','sale_items','payments','stock_movements','period_closures','store_settings','loyalty_settings','auth_credentials','reservation_offers','orders','order_items'];
+const RESERVATION_TABLES = ['reservation_offers','orders','order_items'];
 
 const CACHE_TTL_MS = 15_000;
 const storeLookupCache = new Map<string, { store: ManagedStore; expires: number }>();
@@ -39,6 +43,28 @@ function storeIndexStatements(db: D1Database, suffix: string) {
   ];
   return defs.map(([name, table, cols]) => db.prepare(`CREATE INDEX IF NOT EXISTS idx_${name}${suffix} ON ${table}${suffix}(${cols})`));
 }
+async function cloneStoreTable(db: D1Database, table: string, storeId: number) {
+  const schema = await first<{sql:string|null}>(db,"SELECT sql FROM sqlite_master WHERE type='table' AND name=?",table);
+  if (!schema?.sql) throw new Error(`Não foi possível preparar a tabela ${table}.`);
+  let sql = schema.sql.replace(new RegExp(`^(CREATE TABLE(?: IF NOT EXISTS)?\\s+)\\"?${table}\\"?`, 'i'), (_match, prefix: string) => `${prefix}${table}__${storeId}`);
+  for (const ref of STORE_TABLES) sql = sql.replace(new RegExp(`(REFERENCES\\s+)\\"?${ref}\\"?\\b`, 'gi'), (_match, prefix: string) => `${prefix}${ref}__${storeId}`);
+  await run(db,sql);
+}
+function reservationIndexStatements(db: D1Database, suffix: string) {
+  const defs: Array<[string, string, string]> = [
+    ['orders_status', 'orders', 'status'], ['orders_employee', 'orders', 'employee_id'],
+    ['order_items_order', 'order_items', 'order_id'], ['order_items_offer', 'order_items', 'offer_id'], ['offers_status', 'reservation_offers', 'status'],
+  ];
+  return defs.map(([name, table, cols]) => db.prepare(`CREATE INDEX IF NOT EXISTS idx_${name}${suffix} ON ${table}${suffix}(${cols})`));
+}
+async function ensureReservationSchema(rootDb: D1Database, storeId: number) {
+  for (const table of RESERVATION_TABLES) {
+    if (!await first(rootDb,"SELECT name FROM sqlite_master WHERE type='table' AND name=?",`${table}__${storeId}`)) await cloneStoreTable(rootDb, table, storeId);
+  }
+  const settings = await first<{sql:string|null}>(rootDb,"SELECT sql FROM sqlite_master WHERE type='table' AND name=?",`store_settings__${storeId}`);
+  if (settings?.sql && !settings.sql.includes('whatsapp_phone')) await rootDb.prepare(`ALTER TABLE store_settings__${storeId} ADD COLUMN whatsapp_phone TEXT NOT NULL DEFAULT ''`).run();
+  await rootDb.batch(reservationIndexStatements(rootDb, `__${storeId}`));
+}
 async function ensureStoreSchema(rootDb: D1Database, store: ManagedStore) {
   if (store.id === 1 || schemaReadyStores.has(store.id)) return;
   try { await rootDb.prepare("ALTER TABLE managed_stores ADD COLUMN store_type TEXT NOT NULL DEFAULT 'complete' CHECK (store_type IN ('complete','lite'))").run(); } catch {}
@@ -49,6 +75,7 @@ async function ensureStoreSchema(rootDb: D1Database, store: ManagedStore) {
     try { await rootDb.prepare(`ALTER TABLE ${table} ADD COLUMN paid_at TEXT`).run(); } catch {}
   }
   await rootDb.batch(storeIndexStatements(rootDb, `__${store.id}`));
+  try { await ensureReservationSchema(rootDb, store.id); } catch (error) { console.error('Reservas indisponíveis nesta loja até a migration 0011 ser aplicada.', error); return; }
   schemaReadyStores.add(store.id);
 }
 
@@ -69,7 +96,7 @@ async function bumpDataVersion(rootDb: D1Database, storeId: number) {
 async function bootstrap(rootDb: D1Database, db: D1Database, storeId: number, since: string | null) {
   const version = await readDataVersion(rootDb, storeId);
   if (version !== null && since !== null && Number(since) === version) return { unchanged: true, version };
-  const [rev, paid, balances, low, top, payments, products, employees, sales, items, settings, loyalty] = await db.batch([
+  const [rev, paid, balances, low, top, payments, products, employees, sales, items, settings, loyalty, pendingOrders] = await db.batch([
     db.prepare("SELECT COALESCE(SUM(total_cents),0) total FROM sales WHERE status='active'"),
     db.prepare('SELECT COALESCE(SUM(amount_cents),0) total FROM payments'),
     db.prepare(DASHBOARD_BALANCES_SQL),
@@ -82,6 +109,7 @@ async function bootstrap(rootDb: D1Database, db: D1Database, storeId: number, si
     db.prepare(`SELECT * FROM sale_items WHERE sale_id IN (SELECT id FROM sales ORDER BY created_at DESC,id DESC LIMIT ${RECENT_SALES_LIMIT}) ORDER BY id`),
     db.prepare('SELECT * FROM store_settings WHERE id=1'),
     db.prepare('SELECT * FROM loyalty_settings WHERE id=1'),
+    db.prepare("SELECT COUNT(*) n FROM orders WHERE status='pending_review'"),
   ]);
   const itemsBySale = new Map<number, Row[]>();
   for (const item of items!.results as Row[]) itemsBySale.set(Number(item.sale_id), [...(itemsBySale.get(Number(item.sale_id)) ?? []), item]);
@@ -102,6 +130,7 @@ async function bootstrap(rootDb: D1Database, db: D1Database, storeId: number, si
       debtors_count: balanceRows.filter((r) => Number(r.balance) > 0).length,
       low_stock_products: low!.results, top_products: top!.results,
       recent_sales: saleList.slice(0, 6), recent_payments: payments!.results,
+      pending_orders: Number((pendingOrders!.results[0] as { n: number } | undefined)?.n ?? 0),
     },
   };
 }
@@ -232,7 +261,7 @@ async function changePassword(req: Request, env: Env, storeSlug: string) {
   return new Response(JSON.stringify({updated:true}),{headers:{'Content-Type':'application/json','Set-Cookie':await sessionCookie(version,env,storeSlug)}});
 }
 
-async function createSale(db: D1Database, input: { employee_id: number; items: Array<{ product_id: number; quantity: number }>; notes?: string; created_by?: string; payment_status?: 'paid' | 'pending'; corrected_from_sale_id?: number | null; stockCredits?: Map<number, number>; preStatements?: D1PreparedStatement[] }) {
+async function createSale(db: D1Database, input: { employee_id: number; items: Array<{ product_id: number; quantity: number }>; notes?: string; created_by?: string; payment_status?: 'paid' | 'pending'; corrected_from_sale_id?: number | null; stockCredits?: Map<number, number>; preStatements?: D1PreparedStatement[]; saleId?: number }) {
   const employee = await first<{ id: number; name: string; active: number }>(db, 'SELECT id,name,active FROM employees WHERE id=?', input.employee_id);
   if (!employee) throw new Error('Cliente não encontrado.');
   if (!employee.active) throw new Error('Cliente está inativo.');
@@ -252,7 +281,7 @@ async function createSale(db: D1Database, input: { employee_id: number; items: A
     if (before < qty) throw new Error(`Estoque insuficiente para "${product.name}" (disponível: ${before}).`);
     lines.push({ id: pid, product, qty, subtotal: Number(product.price_cents) * qty, before });
   }
-  const saleId = await newId(db, 'sales'), stamp = now(), actor = input.created_by || 'Administrador';
+  const saleId = input.saleId ?? await newId(db, 'sales'), stamp = now(), actor = input.created_by || 'Administrador';
   const total = lines.reduce((sum, line) => sum + line.subtotal, 0);
   const statements: D1PreparedStatement[] = [...(input.preStatements ?? []), db.prepare(`INSERT INTO sales(id,employee_id,total_cents,status,notes,corrected_from_sale_id,created_by,created_at,payment_status,paid_at)
     VALUES(?,?,?,'active',?,?,?,?,?,?)`).bind(saleId, input.employee_id, total, input.notes?.trim() ?? '', input.corrected_from_sale_id ?? null, actor, stamp, input.payment_status ?? 'untracked', input.payment_status === 'paid' ? stamp : null)];
@@ -286,14 +315,8 @@ async function createManagedStore(db: D1Database, env: Env, data: Record<string,
   const storeId = Number(created.meta.last_row_id) || Number((await first<{id:number}>(db,'SELECT id FROM managed_stores WHERE slug=?',slug))?.id);
   const tableNames = [...STORE_TABLES];
   try {
-    for (const table of tableNames) {
-      const schema = await first<{sql:string|null}>(db,"SELECT sql FROM sqlite_master WHERE type='table' AND name=?",table);
-      if (!schema?.sql) throw new Error(`Não foi possível preparar a tabela ${table}.`);
-      let sql = schema.sql.replace(new RegExp(`^(CREATE TABLE(?: IF NOT EXISTS)?\\s+)\\"?${table}\\"?`, 'i'), (_match, prefix: string) => `${prefix}${table}__${storeId}`);
-      for (const ref of tableNames) sql = sql.replace(new RegExp(`(REFERENCES\\s+)\\"?${ref}\\"?\\b`, 'gi'), (_match, prefix: string) => `${prefix}${ref}__${storeId}`);
-      await run(db,sql);
-    }
-    await db.batch(storeIndexStatements(db, `__${storeId}`));
+    for (const table of tableNames) await cloneStoreTable(db, table, storeId);
+    await db.batch([...storeIndexStatements(db, `__${storeId}`), ...reservationIndexStatements(db, `__${storeId}`)]);
     schemaReadyStores.add(storeId);
     const scoped = scopedDatabase(db,storeId);
     await run(scoped,`INSERT INTO store_settings(id,store_name,logo_data_url,pix_key,pix_key_type,pix_beneficiary_name,pix_city,billing_message_template,brand_primary_color,brand_secondary_color,updated_at)
@@ -363,12 +386,14 @@ async function saveIdempotentResult(rootDb: D1Database, storeId: number, key: st
   } catch {}
 }
 
+const reservationDeps: ReservationDeps = { json, err, first, all, run, body, newId, now, balance, createSale: (db, input) => createSale(db, input as Parameters<typeof createSale>[1]) };
+
 async function handleApi(req: Request, env: Env, store: ManagedStore, rootDb: D1Database): Promise<Response> {
   const rawKey = req.method === 'POST' ? req.headers.get('Idempotency-Key') : null;
   const idempotencyKey = rawKey && IDEMPOTENCY_KEY_PATTERN.test(rawKey) ? rawKey : null;
   // A reexecução só é consultada depois da autenticação (dentro de routeApi), para não vazar respostas.
   const response = await routeApi(req, env, store, rootDb, idempotencyKey);
-  const isMutation = req.method !== 'GET' && response.ok && !new URL(req.url).pathname.startsWith('/api/auth/');
+  const isMutation = req.method !== 'GET' && response.ok && !/^\/api\/(auth|public\/(identify|logout))/.test(new URL(req.url).pathname);
   if (isMutation && response.headers.get('X-Idempotent-Replay') !== 'true') {
     await bumpDataVersion(rootDb, store.id);
     if (idempotencyKey) await saveIdempotentResult(rootDb, store.id, idempotencyKey, response);
@@ -386,8 +411,10 @@ async function routeApi(req: Request, env: Env, store: ManagedStore, rootDb: D1D
     if (path === '/api/auth/status' && method === 'GET') return json({ authenticated: await isAuthenticated(req, storeEnv, store.slug) });
     if (path === '/api/auth/login' && method === 'POST') return login(req, storeEnv,store.username,store.slug);
     if (path === '/api/auth/logout' && method === 'POST') return new Response(JSON.stringify({ authenticated: false }), { headers: { 'Content-Type': 'application/json', 'Set-Cookie': `${sessionCookieName(store.slug)}=; Path=${sessionCookiePath(store.slug)}; HttpOnly; Secure; SameSite=Strict; Max-Age=0` } });
+    if (path.startsWith('/api/public/')) return handleReservationsPublic({ req, url, path, method, db, rootDb, deps: reservationDeps, store, env: storeEnv, cookieName: `cust_${store.slug.replaceAll('-', '_')}`, cookiePath: sessionCookiePath(store.slug) });
     if (!await isAuthenticated(req, storeEnv, store.slug)) return err('Faça login para acessar os dados da loja.', 401);
     if (idempotencyKey) { const replay = await findIdempotentReplay(rootDb, store.id, idempotencyKey); if (replay) return replay; }
+    if (store.store_type !== 'lite') { const handled = await handleReservationsAdmin({ req, url, path, method, db, deps: reservationDeps }); if (handled) return handled; }
     if (path === '/api/auth/password' && method === 'POST') return changePassword(req, storeEnv,store.slug);
     if (path === '/api/bootstrap' && method === 'GET') return json(await bootstrap(rootDb, db, store.id, url.searchParams.get('since')));
     if (path === '/api/settings' && method === 'GET') return json(await first(db, 'SELECT * FROM store_settings WHERE id=1'));
@@ -397,12 +424,13 @@ async function routeApi(req: Request, env: Env, store: ManagedStore, rootDb: D1D
       const logo = String(data.logo_data_url ?? old.logo_data_url ?? '').trim();
       if (logo && !logo.startsWith('data:image/') && !logo.startsWith('/')) return err('Formato de logotipo inválido.');
       const primaryColor = /^#[0-9a-fA-F]{6}$/.test(String(data.brand_primary_color ?? old.brand_primary_color ?? '')) ? String(data.brand_primary_color ?? old.brand_primary_color) : '#047857';
+      const whatsappPhone = String(data.whatsapp_phone ?? old.whatsapp_phone ?? '').replace(/\D/g, '').slice(0, 15);
       const secondaryColor = /^#[0-9a-fA-F]{6}$/.test(String(data.brand_secondary_color ?? old.brand_secondary_color ?? '')) ? String(data.brand_secondary_color ?? old.brand_secondary_color) : '#f59e0b';
-      await run(db, `UPDATE store_settings SET store_name=?,logo_data_url=?,pix_key=?,pix_key_type=?,pix_beneficiary_name=?,pix_city=?,billing_message_template=?,brand_primary_color=?,brand_secondary_color=?,updated_at=? WHERE id=1`,
+      await run(db, `UPDATE store_settings SET store_name=?,logo_data_url=?,pix_key=?,pix_key_type=?,pix_beneficiary_name=?,pix_city=?,billing_message_template=?,brand_primary_color=?,brand_secondary_color=?,whatsapp_phone=?,updated_at=? WHERE id=1`,
         String(data.store_name ?? old.store_name ?? 'Marlene Interprise').trim() || 'Marlene Interprise', logo,
         String(data.pix_key ?? old.pix_key ?? '').trim(), types.includes(data.pix_key_type) ? data.pix_key_type : (old.pix_key_type ?? 'auto'),
         String(data.pix_beneficiary_name ?? old.pix_beneficiary_name ?? 'MARLENE INTERPRISE').trim(),
-        String(data.pix_city ?? old.pix_city ?? 'SAO PAULO').trim(), String(data.billing_message_template ?? old.billing_message_template ?? ''), primaryColor, secondaryColor, now());
+        String(data.pix_city ?? old.pix_city ?? 'SAO PAULO').trim(), String(data.billing_message_template ?? old.billing_message_template ?? ''), primaryColor, secondaryColor, whatsappPhone, now());
       return json(await first(db, 'SELECT * FROM store_settings WHERE id=1'));
     }
     if (path === '/api/loyalty/settings' && method === 'GET') return json(await first(db, 'SELECT * FROM loyalty_settings WHERE id=1'));
