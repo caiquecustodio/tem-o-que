@@ -6,6 +6,7 @@ interface ManagedStore {
   slug: string;
   store_name: string;
   username: string;
+  store_type: 'complete' | 'lite';
   created_at: string;
 }
 
@@ -31,6 +32,7 @@ export function PlatformAdminView() {
   const [slug, setSlug] = useState('');
   const [storeUsername, setStoreUsername] = useState('');
   const [storePassword, setStorePassword] = useState('');
+  const [storeType, setStoreType] = useState<'complete' | 'lite'>('complete');
   const [productLines, setProductLines] = useState('');
   const [saving, setSaving] = useState(false);
   const [notice, setNotice] = useState('');
@@ -64,11 +66,11 @@ export function PlatformAdminView() {
     try {
       const products = productLines.split(/\r?\n/).map((name) => name.trim()).filter(Boolean).map((name) => ({ name, category: 'Lanches & Bebidas', price_cents: 0, stock: 0, min_stock: 5, available: 0 }));
       const initialPassword = storePassword;
-      const created = await call<ManagedStore>('/api/admin/stores', { method: 'POST', body: JSON.stringify({ store_name: storeName, slug, username: storeUsername, password: initialPassword, products }) });
+      const created = await call<ManagedStore>('/api/admin/stores', { method: 'POST', body: JSON.stringify({ store_name: storeName, slug, username: storeUsername, password: initialPassword, products, store_type: storeType }) });
       setStores((current) => [...current, created]);
       setAccessText(makeAccessText(created, initialPassword));
       setCopied(false);
-      setStoreName(''); setSlug(''); setStoreUsername(''); setStorePassword(''); setProductLines('');
+      setStoreName(''); setSlug(''); setStoreUsername(''); setStorePassword(''); setProductLines(''); setStoreType('complete');
       setNotice(`Loja ${created.store_name} criada. Acesse ${window.location.origin}/s/${created.slug}`);
     } catch (err) { setError((err as Error).message); }
     finally { setSaving(false); }
@@ -129,7 +131,7 @@ export function PlatformAdminView() {
           <h2 className="mb-4 text-base font-semibold">Lojas cadastradas ({stores.length})</h2>
           <div className="divide-y divide-slate-100">
             {stores.map((store) => <div key={store.id} className="flex flex-wrap items-center justify-between gap-3 py-4 first:pt-0 last:pb-0">
-              <div><p className="font-semibold">{store.store_name}</p><p className="mt-0.5 text-xs text-slate-500">Login: {store.username} · Caminho: /s/{store.slug}</p></div>
+              <div><p className="font-semibold">{store.store_name} <span className="ml-1 rounded-full bg-slate-100 px-2 py-0.5 text-[10px] font-semibold uppercase text-slate-600">{store.store_type === 'lite' ? 'Lite' : 'Completa'}</span></p><p className="mt-0.5 text-xs text-slate-500">Login: {store.username} · Caminho: /s/{store.slug}</p></div>
               <div className="flex items-center gap-2">
                 <button type="button" onClick={() => { setAccessText(makeAccessText(store)); setCopied(false); window.scrollTo({ top: 0, behavior: 'smooth' }); }} className="rounded-lg bg-slate-100 px-3 py-2 text-xs font-semibold text-slate-700 hover:bg-slate-200">Gerar texto de acesso</button>
                 <a href={`/s/${store.slug}`} className="rounded-lg bg-emerald-50 px-3 py-2 text-xs font-semibold text-emerald-900 hover:bg-emerald-100">Abrir loja</a>
@@ -146,6 +148,7 @@ export function PlatformAdminView() {
             <label className="space-y-1 text-xs font-semibold text-slate-700">Login do responsável<input required value={storeUsername} onChange={(e) => setStoreUsername(e.target.value)} className="w-full rounded-xl border border-slate-200 px-3 py-2.5 text-sm font-normal" placeholder="yasmin" /></label>
             <label className="space-y-1 text-xs font-semibold text-slate-700">Senha inicial (mínimo 12 caracteres)<input required minLength={12} type="password" autoComplete="new-password" value={storePassword} onChange={(e) => setStorePassword(e.target.value)} className="w-full rounded-xl border border-slate-200 px-3 py-2.5 text-sm font-normal" /></label>
           </div>
+          <fieldset className="space-y-2"><legend className="text-xs font-semibold text-slate-700">Tipo de loja</legend><div className="grid gap-2 sm:grid-cols-2">{([{ value: 'complete', title: 'Completa', detail: 'Todos os recursos atuais.' }, { value: 'lite', title: 'Lite', detail: 'PDV, estoque, clientes e pendências.' }] as const).map((option) => <label key={option.value} className={`cursor-pointer rounded-xl border p-3 ${storeType === option.value ? 'border-emerald-600 bg-emerald-50' : 'border-slate-200'}`}><input className="sr-only" type="radio" name="store-type" value={option.value} checked={storeType === option.value} onChange={() => setStoreType(option.value)} /><span className="block text-sm font-semibold">{option.title}</span><span className="mt-0.5 block text-xs font-normal text-slate-500">{option.detail}</span></label>)}</div></fieldset>
           <label className="block space-y-1 text-xs font-semibold text-slate-700">Produtos iniciais (um por linha)<textarea rows={3} value={productLines} onChange={(e) => setProductLines(e.target.value)} className="w-full rounded-xl border border-slate-200 px-3 py-2.5 text-sm font-normal" placeholder={'Cuscuz salgado\nBolo mole'} /></label>
           <p className="text-xs text-slate-500">Produtos iniciais ficam sem preço e indisponíveis até serem configurados no catálogo.</p>
           <button disabled={saving} className="inline-flex min-h-11 items-center gap-2 rounded-xl bg-emerald-700 px-5 py-3 text-sm font-semibold text-white hover:bg-emerald-800 disabled:opacity-50">{saving ? <LoaderCircle className="h-4 w-4 animate-spin" /> : <Plus className="h-4 w-4" />}{saving ? 'Criando loja…' : 'Criar loja'}</button>

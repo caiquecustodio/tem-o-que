@@ -1,0 +1,11 @@
+import { useMemo, useState } from 'react';
+import { Search, UserPlus } from 'lucide-react';
+import type { Employee } from '../types';
+import { api } from '../api/client';
+
+export function LiteCustomersView({ customers, onDataChanged }: { customers: Employee[]; onDataChanged: () => Promise<void> }) {
+ const [query,setQuery]=useState(''); const [name,setName]=useState(''); const [error,setError]=useState(''); const [saving,setSaving]=useState(false);
+ const filtered=useMemo(()=>customers.filter(c=>c.active && c.name.toLowerCase().includes(query.trim().toLowerCase())).sort((a,b)=>a.name.localeCompare(b.name)),[customers,query]);
+ const add=async(event:React.FormEvent)=>{event.preventDefault();if(!name.trim())return;setSaving(true);setError('');try{await api.createCustomer(name.trim());setName('');await onDataChanged();}catch(e){setError((e as Error).message)}finally{setSaving(false)}};
+ return <section className="mx-auto max-w-3xl space-y-4"><header><h2 className="text-lg font-semibold">Clientes</h2><p className="text-sm text-slate-500">Cadastro simples pelo nome.</p></header><form onSubmit={add} className="flex gap-2 rounded-2xl border border-slate-200 bg-white p-3"><input maxLength={120} required value={name} onChange={e=>setName(e.target.value)} placeholder="Nome do cliente" className="min-w-0 flex-1 rounded-xl border border-slate-200 px-3 py-2.5 text-sm"/><button disabled={saving} className="inline-flex min-h-10 items-center gap-2 rounded-xl bg-emerald-700 px-4 text-sm font-semibold text-white disabled:opacity-50"><UserPlus className="h-4 w-4"/>Adicionar</button></form>{error&&<p role="alert" className="rounded-xl bg-red-50 p-3 text-sm text-red-800">{error}</p>}<div className="overflow-hidden rounded-2xl border border-slate-200 bg-white"><label className="flex items-center gap-2 border-b border-slate-100 p-3"><Search className="h-4 w-4 text-slate-400"/><input value={query} onChange={e=>setQuery(e.target.value)} placeholder="Buscar cliente" className="w-full text-sm outline-none"/></label><div className="divide-y divide-slate-100">{filtered.map(customer=><p key={customer.id} className="px-4 py-3 text-sm font-medium">{customer.name}</p>)}{filtered.length===0&&<p className="p-6 text-center text-sm text-slate-500">Nenhum cliente encontrado.</p>}</div></div></section>;
+}

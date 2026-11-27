@@ -5,6 +5,7 @@ import { api } from '../api/client';
 import { CATEGORY_IMAGES, CATEGORY_OPTIONS, formatDateTime, parseBRLToCents } from '../utils/format';
 
 interface InventoryViewProps {
+  storeType?: 'complete' | 'lite';
   products: Product[];
   preselectedProductId?: number | null;
   onClearPreselected?: () => void;
@@ -18,7 +19,7 @@ const MOVEMENT_LABELS: Record<string, { label: string; tone: string }> = {
   adjustment: { label: 'Ajuste', tone: 'text-slate-900' },
 };
 
-export function InventoryView({ products, preselectedProductId, onClearPreselected, onDataChanged }: InventoryViewProps) {
+export function InventoryView({ products, preselectedProductId, onClearPreselected, onDataChanged, storeType = 'complete' }: InventoryViewProps) {
   const [tab, setTab] = useState<'levels' | 'movements'>('levels');
   const [search, setSearch] = useState('');
   const [categoryFilter, setCategoryFilter] = useState('Todos');
@@ -45,6 +46,15 @@ export function InventoryView({ products, preselectedProductId, onClearPreselect
   const [deleteTarget, setDeleteTarget] = useState<Product | null>(null);
   const [deleteError, setDeleteError] = useState<string | null>(null);
   const [deleting, setDeleting] = useState(false);
+  const [liteDrafts, setLiteDrafts] = useState<Record<number, { stock: string; price: string }>>({});
+  const [liteName, setLiteName] = useState('');
+  const [liteStock, setLiteStock] = useState('0');
+  const [litePrice, setLitePrice] = useState('');
+  const [liteSaving, setLiteSaving] = useState<number | 'new' | null>(null);
+  const [liteError, setLiteError] = useState('');
+  const [liteDeleteConfirmed, setLiteDeleteConfirmed] = useState(false);
+  const [liteEditingId, setLiteEditingId] = useState<number | null>(null);
+  const [liteNameDraft, setLiteNameDraft] = useState('');
 
   useEffect(() => {
     api.getStockMovements().then(setMovements).catch(() => {});
@@ -149,6 +159,51 @@ export function InventoryView({ products, preselectedProductId, onClearPreselect
   }, [products, search, categoryFilter, onlyLow]);
 
   const lowCount = products.filter((p) => p.stock <= p.min_stock).length;
+  const usesSimpleInventory = true;
+
+  const saveLiteProduct = async (product: Product) => {
+    const draft = liteDrafts[product.id] ?? { stock: String(product.stock), price: (product.price_cents / 100).toFixed(2).replace('.', ',') };
+    const stock = Number(draft.stock), price = parseBRLToCents(draft.price), name = liteEditingId === product.id ? liteNameDraft.trim() : product.name;
+    if (!name) { setLiteError('Informe o nome do produto.'); return; }
+    if (!Number.isInteger(stock) || stock < 0 || !draft.price.trim()) { setLiteError('Informe uma quantidade válida e o preço do produto.'); return; }
+    setLiteSaving(product.id); setLiteError('');
+    try {
+      if (name !== product.name || price !== product.price_cents || !product.available) await api.updateProduct(product.id, { name, description: product.description, category: product.category, image_url: product.image_url, price_cents: price, min_stock: product.min_stock, available: 1 });
+      if (stock !== product.stock) await api.adjustStock(product.id, { type: 'adjustment', new_stock: stock, reason: 'Atualização simples do estoque' });
+      setLiteEditingId(null);
+      await onDataChanged();
+    } catch (error) { setLiteError((error as Error).message); }
+    finally { setLiteSaving(null); }
+  };
+
+  const createLiteProduct = async (event: React.FormEvent) => {
+    event.preventDefault(); const stock = Number(liteStock), price = parseBRLToCents(litePrice);
+    if (!liteName.trim() || !Number.isInteger(stock) || stock < 0 || !litePrice.trim()) { setLiteError('Informe o nome, a quantidade e o preço.'); return; }
+    setLiteSaving('new'); setLiteError('');
+    try {
+      await api.createProduct({ name: liteName.trim(), description: '', category: 'Outros', image_url: CATEGORY_IMAGES.Outros, price_cents: price, stock, min_stock: 0, available: 1 });
+      setLiteName(''); setLiteStock('0'); setLitePrice(''); await onDataChanged();
+    } catch (error) { setLiteError((error as Error).message); }
+    finally { setLiteSaving(null); }
+  };
+
+  if (usesSimpleInventory) return (
+    <div className="mx-auto max-w-4xl space-y-5">
+      <header><h2 className="text-lg font-semibold">Estoque</h2><p className="text-sm text-slate-500">Informe a quantidade que tem e o preço de cada produto.</p></header>
+      <form onSubmit={createLiteProduct} className="grid gap-3 rounded-2xl border border-slate-200 bg-white p-4 sm:grid-cols-[minmax(0,1fr)_130px_150px_auto] sm:items-end">
+        <label className="space-y-1 text-xs font-semibold text-slate-700">Novo produto<input required value={liteName} onChange={e=>setLiteName(e.target.value)} placeholder="Nome do produto" className="w-full rounded-xl border border-slate-200 px-3 py-2.5 text-sm font-normal" /></label>
+        <label className="space-y-1 text-xs font-semibold text-slate-700">Quantidade<input required type="number" min="0" step="1" value={liteStock} onChange={e=>setLiteStock(e.target.value)} className="w-full rounded-xl border border-slate-200 px-3 py-2.5 text-sm font-mono" /></label>
+        <label className="space-y-1 text-xs font-semibold text-slate-700">Preço (R$)<input required inputMode="decimal" value={litePrice} onChange={e=>setLitePrice(e.target.value)} placeholder="0,00" className="w-full rounded-xl border border-slate-200 px-3 py-2.5 text-sm font-mono" /></label>
+        <button disabled={liteSaving!==null} className="min-h-10 rounded-xl bg-emerald-700 px-4 text-sm font-semibold text-white disabled:opacity-50">{liteSaving==='new'?'Adicionando…':'Adicionar'}</button>
+      </form>
+      {liteError && <p role="alert" className="rounded-xl bg-red-50 p-3 text-sm text-red-800">{liteError}</p>}
+      <div className="overflow-hidden rounded-2xl border border-slate-200 bg-white">
+        <div className="hidden grid-cols-[minmax(0,1fr)_120px_140px_290px] gap-3 border-b border-slate-200 bg-slate-50 px-4 py-3 text-xs font-semibold text-slate-600 sm:grid"><span>Produto</span><span>Quantidade</span><span>Preço (R$)</span><span /></div>
+        {filteredProducts.map(product=>{ const draft=liteDrafts[product.id]??{stock:String(product.stock),price:(product.price_cents/100).toFixed(2).replace('.',',')}; return <div key={product.id} className="grid gap-3 border-b border-slate-100 p-4 last:border-b-0 sm:grid-cols-[minmax(0,1fr)_120px_140px_290px] sm:items-center">{liteEditingId===product.id?<input autoFocus aria-label={`Nome de ${product.name}`} value={liteNameDraft} onChange={e=>setLiteNameDraft(e.target.value)} className="w-full rounded-xl border border-slate-200 px-3 py-2.5 text-sm"/>:<p className="truncate text-sm font-semibold">{product.name}</p>}<label className="space-y-1 text-xs font-medium text-slate-500 sm:space-y-0"><span className="sm:sr-only">Quantidade</span><input aria-label={`Quantidade de ${product.name}`} type="number" min="0" step="1" value={draft.stock} onChange={e=>setLiteDrafts(curr=>({...curr,[product.id]:{...draft,stock:e.target.value}}))} className="w-full rounded-xl border border-slate-200 px-3 py-2.5 text-sm font-mono text-slate-900" /></label><label className="space-y-1 text-xs font-medium text-slate-500 sm:space-y-0"><span className="sm:sr-only">Preço (R$)</span><input aria-label={`Preço de ${product.name}`} inputMode="decimal" value={draft.price} onChange={e=>setLiteDrafts(curr=>({...curr,[product.id]:{...draft,price:e.target.value}}))} className="w-full rounded-xl border border-slate-200 px-3 py-2.5 text-sm font-mono text-slate-900" /></label><div className="flex items-center gap-2"><button disabled={liteSaving!==null||deleting} onClick={()=>{setLiteEditingId(liteEditingId===product.id?null:product.id);setLiteNameDraft(product.name);}} aria-label={`Editar nome de ${product.name}`} className="inline-flex min-h-10 items-center justify-center rounded-xl border border-slate-200 bg-slate-50 px-3 text-xs font-semibold text-slate-700 hover:bg-slate-100 disabled:opacity-50"><Edit2 className="h-4 w-4 sm:mr-1.5"/><span className="hidden sm:inline">{liteEditingId===product.id?'Fechar edição':'Editar'}</span></button><button disabled={liteSaving!==null||deleting} onClick={()=>{setDeleteTarget(product);setDeleteError(null);setLiteDeleteConfirmed(false);}} aria-label={`Excluir ${product.name}`} className="inline-flex min-h-10 items-center justify-center rounded-xl border border-red-200 bg-red-50 px-3 text-xs font-semibold text-red-700 hover:bg-red-100 disabled:opacity-50"><Trash2 className="h-4 w-4 sm:mr-1.5"/><span className="hidden sm:inline">Excluir</span></button><button disabled={liteSaving!==null||deleting} onClick={()=>void saveLiteProduct(product)} className="min-h-10 rounded-xl bg-slate-900 px-3 text-xs font-semibold text-white disabled:opacity-50">{liteSaving===product.id?'Salvando…':'Salvar'}</button></div></div>; })}
+        {filteredProducts.length===0&&<p className="p-8 text-center text-sm text-slate-500">Nenhum produto cadastrado.</p>}
+      </div>
+    </div>
+  );
 
   return (
     <div className="space-y-5">
@@ -498,17 +553,15 @@ export function InventoryView({ products, preselectedProductId, onClearPreselect
             <div className="flex items-start gap-3">
               <div className="w-10 h-10 rounded-xl bg-red-50 text-red-700 flex items-center justify-center shrink-0"><Trash2 className="w-5 h-5" /></div>
               <div>
-                <h3 className="text-lg font-semibold text-slate-900">Excluir produto?</h3>
-                <p className="text-sm text-slate-600 mt-1"><strong>{deleteTarget.name}</strong> será removido do catálogo e seu histórico de estoque e preços também será apagado.</p>
+                <h3 className="text-lg font-semibold text-slate-900">{usesSimpleInventory && !liteDeleteConfirmed ? 'Confirmar exclusão?' : 'Excluir definitivamente?'}</h3>
+                <p className="text-sm text-slate-600 mt-1"><strong>{deleteTarget.name}</strong> será removido do estoque. {liteDeleteConfirmed ? 'Esta ação não pode ser desfeita. Confirme para excluir.' : 'Quer continuar? Você terá que confirmar novamente na próxima etapa.'}</p>
               </div>
             </div>
-            <p className="text-xs text-slate-500">Produtos vinculados a vendas antigas não podem ser excluídos; pause-os no catálogo para preservar o histórico.</p>
+            {liteDeleteConfirmed && <p className="text-xs text-slate-500">Produtos vinculados a vendas antigas não podem ser excluídos; o histórico de vendas será preservado.</p>}
             {deleteError && <p role="alert" className="p-3 text-xs text-red-800 bg-red-50 border border-red-200 rounded-xl">{deleteError}</p>}
             <div className="flex justify-end gap-2 pt-1">
-              <button onClick={() => setDeleteTarget(null)} className="px-4 py-2.5 text-sm font-medium text-slate-700 hover:bg-slate-100 rounded-xl">Cancelar</button>
-              <button onClick={handleDeleteProduct} disabled={deleting} className="px-4 py-2.5 text-sm font-semibold text-white bg-red-600 hover:bg-red-700 disabled:opacity-50 rounded-xl">
-                {deleting ? 'Excluindo…' : 'Excluir produto'}
-              </button>
+              <button onClick={() => { setDeleteTarget(null); setLiteDeleteConfirmed(false); }} className="px-4 py-2.5 text-sm font-medium text-slate-700 hover:bg-slate-100 rounded-xl">Cancelar</button>
+              {usesSimpleInventory && !liteDeleteConfirmed ? <button onClick={() => setLiteDeleteConfirmed(true)} className="px-4 py-2.5 text-sm font-semibold text-white bg-red-600 hover:bg-red-700 rounded-xl">Sim, continuar</button> : <button onClick={handleDeleteProduct} disabled={deleting} className="px-4 py-2.5 text-sm font-semibold text-white bg-red-600 hover:bg-red-700 disabled:opacity-50 rounded-xl">{deleting ? 'Excluindo…' : 'Excluir produto'}</button>}
             </div>
           </div>
         </div>
@@ -599,3 +652,4 @@ export function InventoryView({ products, preselectedProductId, onClearPreselect
     </div>
   );
 }
+

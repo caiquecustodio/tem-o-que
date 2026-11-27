@@ -13,7 +13,10 @@ import type {
   Sale,
   StockMovement,
   StoreSettings,
+  StoreType,
 } from '../types';
+
+export interface StoreInfo { id: number; slug: string; store_name: string; username: string; store_type: StoreType; created_at: string }
 
 export function getStorePathPrefix() {
   return window.location.pathname.match(/^\/s\/([a-z0-9-]+)/)?.[0] ?? '';
@@ -44,6 +47,11 @@ async function request<T>(url: string, options?: RequestInit): Promise<T> {
 }
 
 export const api = {
+  getStoreInfo: () => request<StoreInfo>('/api/store-info'),
+  getCustomers: () => request<Employee[]>('/api/customers'),
+  createCustomer: (name: string) => request<Employee>('/api/customers', { method: 'POST', body: JSON.stringify({ name }) }),
+  getPendingSales: () => request<Sale[]>('/api/pending-sales'),
+  settleSale: (id: number) => request<Sale>(`/api/sales/${id}/settle`, { method: 'POST' }),
   changePassword: (payload: { current_password: string; new_password: string; confirm_password: string }) =>
     request<{ updated: boolean }>('/api/auth/password', { method: 'POST', body: JSON.stringify(payload) }),
   getDashboard: () => request<DashboardSummary>('/api/dashboard'),
@@ -97,6 +105,7 @@ export const api = {
     items: Array<{ product_id: number; quantity: number }>;
     notes?: string;
     created_by?: string;
+    payment_status?: 'paid' | 'pending';
   }) => request<Sale>('/api/sales', { method: 'POST', body: JSON.stringify(payload) }),
   cancelSale: (id: number, reason: string) =>
     request<Sale>(`/api/sales/${id}/cancel`, { method: 'POST', body: JSON.stringify({ reason }) }),

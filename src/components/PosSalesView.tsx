@@ -13,7 +13,7 @@ import {
   X,
   XCircle,
 } from 'lucide-react';
-import type { Employee, LoyaltyProgress, LoyaltySettings, Product, Sale, StoreSettings } from '../types';
+import type { Employee, LoyaltyProgress, LoyaltySettings, Product, Sale, StoreSettings, StoreType } from '../types';
 import { api } from '../api/client';
 import { CATEGORY_OPTIONS, formatBRL, formatDateTime } from '../utils/format';
 import { ProductImage } from './ProductImage';
@@ -25,6 +25,7 @@ interface PosSalesViewProps {
   sales: Sale[];
   loyaltySettings: LoyaltySettings | null;
   storeSettings: StoreSettings;
+  storeType: StoreType;
   onDataChanged: () => Promise<void>;
 }
 
@@ -33,10 +34,12 @@ interface CartItem {
   quantity: number;
 }
 
-export function PosSalesView({ products, employees, sales, loyaltySettings, storeSettings, onDataChanged }: PosSalesViewProps) {
+export function PosSalesView({ products, employees, sales, loyaltySettings, storeSettings, storeType, onDataChanged }: PosSalesViewProps) {
   const [subTab, setSubTab] = useState<'register' | 'history'>('register');
   const [selectedCategory, setSelectedCategory] = useState<string>('Todos');
   const [search, setSearch] = useState('');
+  const [paymentStatus, setPaymentStatus] = useState<'paid' | 'pending'>('paid');
+  const [customerSearch, setCustomerSearch] = useState('');
   const [selectedEmployeeId, setSelectedEmployeeId] = useState<number>(() => employees[0]?.id ?? 0);
   const [cart, setCart] = useState<Record<number, CartItem>>({});
   const [notes, setNotes] = useState('');
@@ -108,19 +111,14 @@ export function PosSalesView({ products, employees, sales, loyaltySettings, stor
       setNewClientError('Informe o nome completo do cliente.');
       return;
     }
-    if (!newClientPhone.trim()) {
+    if (storeType !== 'lite' && !newClientPhone.trim()) {
       setNewClientError('Informe o WhatsApp do cliente.');
       return;
     }
     setSubmitting(true);
     setNewClientError(null);
     try {
-      const created = await api.createEmployee({
-        name: newClientName.trim(),
-        department: '',
-        phone: newClientPhone.trim(),
-        email: '',
-      });
+      const created = storeType === 'lite' ? await api.createCustomer(newClientName.trim()) : await api.createEmployee({ name: newClientName.trim(), department: '', phone: newClientPhone.trim(), email: '' });
       await onDataChanged();
       setSelectedEmployeeId(created.id);
       setShowNewClientModal(false);
@@ -152,6 +150,7 @@ export function PosSalesView({ products, employees, sales, loyaltySettings, stor
         items: cartList.map((c) => ({ product_id: c.product.id, quantity: c.quantity })),
         notes,
         created_by: 'Administrador',
+        ...(storeType === 'lite' ? { payment_status: paymentStatus } : {}),
       });
       setCart({});
       setNotes('');
@@ -162,7 +161,7 @@ export function PosSalesView({ products, employees, sales, loyaltySettings, stor
       }
       setFeedback({
         type: 'success',
-        message: `Venda #${created.id} registrada para ${created.employee_name} (${formatBRL(created.total_cents)}).`,
+        message: `Venda #${created.id} registrada para ${created.employee_name} (${formatBRL(created.total_cents)})${storeType === 'lite' ? paymentStatus === 'paid' ? ' · paga' : ' · pendente' : ''}.`,
       });
     } catch (err) {
       setFeedback({ type: 'error', message: (err as Error).message });
@@ -268,19 +267,25 @@ export function PosSalesView({ products, employees, sales, loyaltySettings, stor
             Novo cliente
           </button>
         </div>
+        {storeType === 'lite' && <>
+          <input value={customerSearch} onChange={(event) => { setCustomerSearch(event.target.value); const match = activeEmployees.find((employee) => employee.name.toLowerCase() === event.target.value.trim().toLowerCase()); setSelectedEmployeeId(match?.id ?? 0); }} placeholder="Buscar cliente pelo nome" className="mb-2 w-full rounded-xl border border-slate-200 bg-slate-50 px-3 py-2.5 text-sm" list="lite-customer-options" />
+          <datalist id="lite-customer-options">{activeEmployees.filter((employee) => !customerSearch || employee.name.toLowerCase().includes(customerSearch.toLowerCase())).map((employee) => <option key={employee.id} value={employee.name} />)}</datalist>
+          <button type="button" onClick={() => { setNewClientError(null); setNewClientPhone(''); setShowNewClientModal(true); }} className="mb-2 text-xs font-semibold text-emerald-700">+ Cadastrar novo cliente pelo nome</button>
+        </>}
         <select
           id="pos-employee"
           value={selectedEmployee?.id ?? ''}
           onChange={(e) => setSelectedEmployeeId(Number(e.target.value))}
           className="w-full px-3 py-2.5 text-sm bg-slate-50 border border-slate-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-emerald-600/20 focus:border-emerald-600 min-h-[44px]"
         >
-          {activeEmployees.map((emp) => (
+          {activeEmployees.filter((emp) => storeType !== 'lite' || !customerSearch || emp.name.toLowerCase().includes(customerSearch.toLowerCase())).map((emp) => (
             <option key={emp.id} value={emp.id}>
               {emp.name} ({emp.phone || emp.code})
             </option>
           ))}
         </select>
-        {selectedEmployee && (
+        {selectedEmployee && storeType === 'lite' && <p className="text-sm font-semibold text-slate-800">Cliente: {selectedEmployee.name}</p>}
+        {selectedEmployee && storeType !== 'lite' && (
           <div className="flex items-center justify-between text-xs text-slate-500 pt-0.5">
             <span>Saldo em aberto atual</span>
             <span className="font-mono tabular-nums font-semibold text-slate-800">
@@ -337,8 +342,9 @@ export function PosSalesView({ products, employees, sales, loyaltySettings, stor
         )}
       </div>
 
+      {storeType === 'lite' && <fieldset className="space-y-2"><legend className="text-xs font-semibold text-slate-600">Pagamento</legend><div className="grid grid-cols-2 gap-2">{([{value:'paid',label:'Pagou'},{value:'pending',label:'Não pagou'}] as const).map(option=><button type="button" key={option.value} onClick={()=>setPaymentStatus(option.value)} className={`min-h-11 rounded-xl border text-sm font-semibold ${paymentStatus===option.value?'border-emerald-700 bg-emerald-50 text-emerald-900':'border-slate-200 text-slate-600'}`}>{option.label}</button>)}</div></fieldset>}
       {/* Notes */}
-      <div className="space-y-1.5">
+      {storeType !== 'lite' && <div className="space-y-1.5">
         <label htmlFor="pos-notes" className="block text-xs font-medium text-slate-600">
           Observação (opcional)
         </label>
@@ -350,7 +356,7 @@ export function PosSalesView({ products, employees, sales, loyaltySettings, stor
           placeholder="Ex.: Retirado no intervalo..."
           className="w-full px-3 py-2.5 text-sm bg-slate-50 border border-slate-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-emerald-600/20 focus:border-emerald-600"
         />
-      </div>
+      </div>}
 
       {/* Totals & Primary CTA */}
       <div className="border-t border-slate-200 pt-4 space-y-3">
@@ -360,7 +366,7 @@ export function PosSalesView({ products, employees, sales, loyaltySettings, stor
             {formatBRL(cartTotalCents)}
           </span>
         </div>
-        {selectedEmployee && cartTotalCents > 0 && (
+        {storeType !== 'lite' && selectedEmployee && cartTotalCents > 0 && (
           <div className="flex items-baseline justify-between text-xs text-slate-500">
             <span>Novo saldo após registro</span>
             <span className="font-mono tabular-nums font-semibold text-slate-800">
@@ -375,7 +381,7 @@ export function PosSalesView({ products, employees, sales, loyaltySettings, stor
             disabled={submitting || cartList.length === 0 || !selectedEmployee}
             className="w-full h-12 px-4 text-sm font-semibold text-white bg-emerald-700 hover:bg-emerald-800 active:scale-[0.98] disabled:bg-slate-200 disabled:text-slate-400 rounded-xl transition-all cursor-pointer whitespace-nowrap"
           >
-            {submitting ? 'Registrando venda...' : 'Confirmar venda na conta'}
+            {submitting ? 'Registrando venda...' : storeType === 'lite' ? 'Registrar venda' : 'Confirmar venda na conta'}
           </button>
         </div>
       </div>
@@ -385,7 +391,7 @@ export function PosSalesView({ products, employees, sales, loyaltySettings, stor
   return (
     <div className="space-y-5">
       {/* Segmented Top Switcher */}
-      <div className="flex flex-wrap items-center justify-between gap-3">
+      {storeType !== 'lite' && <div className="flex flex-wrap items-center justify-between gap-3">
         <div className="inline-flex items-center gap-1 p-1 bg-slate-200/70 rounded-xl">
           <button
             onClick={() => setSubTab('register')}
@@ -404,7 +410,7 @@ export function PosSalesView({ products, employees, sales, loyaltySettings, stor
             Histórico e correções ({sales.length})
           </button>
         </div>
-      </div>
+      </div>}
 
       {feedback && (
         <div
@@ -438,7 +444,7 @@ export function PosSalesView({ products, employees, sales, loyaltySettings, stor
         />
       )}
 
-      {subTab === 'register' ? (
+      {subTab === 'register' || storeType === 'lite' ? (
         <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
           {/* Left: iFood-inspired Menu & Quick Selector */}
           <div className="lg:col-span-8 space-y-4">
@@ -452,7 +458,7 @@ export function PosSalesView({ products, employees, sales, loyaltySettings, stor
                   aria-label="Selecionar cliente"
                   className="w-full mt-0.5 text-sm font-semibold text-slate-900 bg-transparent focus:outline-none truncate"
                 >
-                  {activeEmployees.map((emp) => (
+                  {activeEmployees.filter((emp) => storeType !== 'lite' || !customerSearch || emp.name.toLowerCase().includes(customerSearch.toLowerCase())).map((emp) => (
                     <option key={emp.id} value={emp.id}>
                       {emp.name} ({emp.phone || emp.code})
                     </option>
@@ -762,7 +768,7 @@ export function PosSalesView({ products, employees, sales, loyaltySettings, stor
                       disabled={submitting || cartList.length === 0 || !selectedEmployee}
                       className="w-full h-12 px-4 text-sm font-semibold text-white bg-emerald-700 hover:bg-emerald-800 active:scale-[0.98] disabled:bg-slate-200 disabled:text-slate-400 rounded-xl transition-all cursor-pointer whitespace-nowrap"
                     >
-                      {submitting ? 'Registrando venda...' : cartList.length === 0 ? 'Adicione produtos para continuar' : 'Confirmar venda na conta'}
+                      {submitting ? 'Registrando venda...' : cartList.length === 0 ? 'Adicione produtos para continuar' : storeType === 'lite' ? 'Registrar venda' : 'Confirmar venda na conta'}
                     </button>
                   </div>
                 </motion.div>
@@ -971,7 +977,7 @@ export function PosSalesView({ products, employees, sales, loyaltySettings, stor
                   className="w-full px-3 py-2.5 text-sm border border-slate-200 rounded-xl"
                 />
               </div>
-              <div>
+              {storeType !== 'lite' && <div>
                 <label className="block text-xs font-semibold text-slate-700 mb-1">WhatsApp</label>
                 <input
                   type="text"
@@ -980,7 +986,7 @@ export function PosSalesView({ products, employees, sales, loyaltySettings, stor
                   placeholder="(11) 99999-0000"
                   className="w-full px-3 py-2.5 text-sm font-mono tabular-nums border border-slate-200 rounded-xl"
                 />
-              </div>
+              </div>}
             </div>
             <div className="flex justify-end gap-3 pt-2">
               <button
@@ -1066,7 +1072,7 @@ export function PosSalesView({ products, employees, sales, loyaltySettings, stor
                   onChange={(e) => setCorrectEmployeeId(Number(e.target.value))}
                   className="w-full px-3 py-2 text-sm border border-slate-200 rounded-xl"
                 >
-                  {activeEmployees.map((emp) => (
+                  {activeEmployees.filter((emp) => storeType !== 'lite' || !customerSearch || emp.name.toLowerCase().includes(customerSearch.toLowerCase())).map((emp) => (
                     <option key={emp.id} value={emp.id}>
                       {emp.name} ({emp.phone || emp.code})
                     </option>

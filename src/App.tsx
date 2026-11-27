@@ -18,7 +18,7 @@ import {
 } from 'lucide-react';
 import { AnimatePresence, motion } from 'motion/react';
 import { api, apiUrl } from './api/client';
-import type { DashboardSummary, Employee, LoyaltySettings, Product, Sale, StoreSettings } from './types';
+import type { DashboardSummary, Employee, LoyaltySettings, Product, Sale, StoreSettings, StoreType } from './types';
 import { DEFAULT_BILLING_TEMPLATE } from './utils/pix';
 import { DashboardView } from './components/DashboardView';
 import { PosSalesView } from './components/PosSalesView';
@@ -28,8 +28,11 @@ import { InventoryView } from './components/InventoryView';
 import { ReportsView } from './components/ReportsView';
 import { SettingsView } from './components/SettingsView';
 import { MenuView } from './components/MenuView';
+import { PendingSalesView } from './components/PendingSalesView';
+import { LiteCustomersView } from './components/LiteCustomersView';
+import { QuickMonthlySalesView } from './components/QuickMonthlySalesView';
 
-type AdminTab = 'dashboard' | 'pos' | 'catalog' | 'accounts' | 'inventory' | 'menu' | 'reports' | 'settings';
+type AdminTab = 'dashboard' | 'pos' | 'catalog' | 'accounts' | 'inventory' | 'menu' | 'reports' | 'settings' | 'pending' | 'customers' | 'quick-report';
 
 const DEFAULT_SETTINGS: StoreSettings = {
   id: 1,
@@ -76,12 +79,16 @@ const ADMIN_NAV: Array<{ id: AdminTab; label: string; icon: typeof LayoutDashboa
   { id: 'catalog', label: 'Catálogo', icon: Package },
   { id: 'accounts', label: 'Contas e fiado', icon: Users },
   { id: 'inventory', label: 'Estoque', icon: Boxes },
+  { id: 'quick-report', label: 'Vendas do mês', icon: BarChart3 },
   { id: 'menu', label: 'Criar cardápio', icon: Utensils },
   { id: 'reports', label: 'Relatórios', icon: BarChart3 },
   { id: 'settings', label: 'Loja e Pix', icon: Settings },
 ];
 
 const TAB_TITLES: Record<AdminTab, { title: string; subtitle: string }> = {
+  pending: { title: 'Pendências', subtitle: 'Vendas em aberto por cliente' },
+  'quick-report': { title: 'Vendas do mês', subtitle: 'Resumo rápido das vendas realizadas' },
+  customers: { title: 'Clientes', subtitle: 'Cadastro simples por nome' },
   dashboard: {
     title: 'Painel Administrativo',
     subtitle: 'Indicadores de faturamento, saldos em aberto e alertas de reposição',
@@ -125,6 +132,7 @@ export default function App() {
   const [employees, setEmployees] = useState<Employee[]>([]);
   const [sales, setSales] = useState<Sale[]>([]);
   const [storeSettings, setStoreSettings] = useState<StoreSettings>(DEFAULT_SETTINGS);
+  const [storeType, setStoreType] = useState<StoreType>('complete');
   const [loyaltySettings, setLoyaltySettings] = useState<LoyaltySettings | null>(null);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -165,9 +173,7 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    fetch(apiUrl('/api/store-info')).then((res) => res.json() as Promise<{ store_name?: string }>).then((data) => {
-      if (data.store_name) setStoreSettings((current) => ({ ...current, store_name: data.store_name! }));
-    }).catch(() => undefined);
+    api.getStoreInfo().then((data) => { const type = data.store_type ?? 'complete'; setStoreType(type); if (type === 'lite') setActiveTab('pos'); if (data.store_name) setStoreSettings((current) => ({ ...current, store_name: data.store_name })); }).catch(() => undefined);
     fetch(apiUrl('/api/auth/status')).then((res) => res.json() as Promise<{ authenticated?: boolean }>).then((data) => setAuthenticated(Boolean(data.authenticated)))
       .catch(() => setAuthenticated(false)).finally(() => setAuthReady(true));
   }, []);
@@ -198,7 +204,8 @@ export default function App() {
   };
 
   const lowStockCount = products.filter((p) => p.stock <= p.min_stock).length;
-  const isMoreTabActive = activeTab === 'catalog' || activeTab === 'menu' || activeTab === 'reports' || activeTab === 'settings';
+  const isMoreTabActive = activeTab === 'catalog' || activeTab === 'menu' || activeTab === 'reports' || activeTab === 'settings' || activeTab === 'pending' || activeTab === 'customers' || activeTab === 'quick-report';
+  const visibleNav = storeType === 'lite' ? [{ id: 'pos' as const, label: 'PDV', icon: ShoppingCart }, { id: 'customers' as const, label: 'Clientes', icon: Users }, { id: 'inventory' as const, label: 'Estoque', icon: Boxes }, { id: 'pending' as const, label: 'Pendências', icon: Users }, { id: 'quick-report' as const, label: 'Relatório', icon: BarChart3 }] : ADMIN_NAV;
   const brandName = storeSettings.store_name || 'Tem o quê?';
   const brandStyle = createBrandStyle(storeSettings.brand_primary_color, storeSettings.brand_secondary_color);
 
@@ -254,7 +261,7 @@ export default function App() {
 
         <div className="flex-1 px-3 py-5 space-y-6 overflow-y-auto">
           <nav className="space-y-1" aria-label="Menu Administrativo">
-            {ADMIN_NAV.map((item) => {
+            {visibleNav.map((item) => {
               const Icon = item.icon;
               const isActive = activeTab === item.id;
               return (
@@ -337,7 +344,7 @@ export default function App() {
             </div>
           ) : (
             <>
-              {activeTab === 'dashboard' && (
+              {storeType !== 'lite' && activeTab === 'dashboard' && (
                 <DashboardView
                   summary={summary}
                   employees={employees}
@@ -347,6 +354,9 @@ export default function App() {
                   onQuickPay={handleQuickPay}
                 />
               )}
+              {storeType === 'lite' && activeTab === 'pending' && <PendingSalesView onDataChanged={refreshAll} />}
+              {activeTab === 'quick-report' && <QuickMonthlySalesView storeType={storeType} />}
+              {storeType === 'lite' && activeTab === 'customers' && <LiteCustomersView customers={employees} onDataChanged={refreshAll} />}
               {activeTab === 'pos' && (
                 <PosSalesView
                   products={products}
@@ -354,11 +364,12 @@ export default function App() {
                   sales={sales}
                   loyaltySettings={loyaltySettings}
                   storeSettings={storeSettings}
+                  storeType={storeType}
                   onDataChanged={refreshAll}
                 />
               )}
-              {activeTab === 'catalog' && <CatalogView products={products} onDataChanged={refreshAll} />}
-              {activeTab === 'accounts' && (
+              {storeType !== 'lite' && activeTab === 'catalog' && <CatalogView products={products} onDataChanged={refreshAll} />}
+              {storeType !== 'lite' && activeTab === 'accounts' && (
                 <AccountsView
                   employees={employees}
                   settings={storeSettings}
@@ -372,15 +383,16 @@ export default function App() {
               )}
               {activeTab === 'inventory' && (
                 <InventoryView
+                  storeType={storeType}
                   products={products}
                   preselectedProductId={restockProductId}
                   onClearPreselected={() => setRestockProductId(null)}
                   onDataChanged={refreshAll}
                 />
               )}
-              {activeTab === 'reports' && <ReportsView onOpenEmployeeAccount={handleOpenEmployeeAccount} />}
-              {activeTab === 'menu' && <MenuView products={products} settings={storeSettings} />}
-              {activeTab === 'settings' && (
+              {storeType !== 'lite' && activeTab === 'reports' && <ReportsView onOpenEmployeeAccount={handleOpenEmployeeAccount} />}
+              {storeType !== 'lite' && activeTab === 'menu' && <MenuView products={products} settings={storeSettings} />}
+              {storeType !== 'lite' && activeTab === 'settings' && (
                 <SettingsView settings={storeSettings} loyaltySettings={loyaltySettings} products={products} onSettingsUpdated={setStoreSettings} onLoyaltySettingsUpdated={setLoyaltySettings} />
               )}
             </>
@@ -391,14 +403,14 @@ export default function App() {
       {/* Fixed Mobile Bottom Navigation Bar */}
       <nav
         aria-label="Navegação rápida"
-        className="lg:hidden fixed bottom-0 left-0 right-0 z-40 h-16 bg-white/95 backdrop-blur-md border-t border-slate-200 grid grid-cols-5 no-print"
+        className={`lg:hidden fixed bottom-0 left-0 right-0 z-40 h-16 bg-white/95 backdrop-blur-md border-t border-slate-200 grid ${storeType === 'lite' ? 'grid-cols-5' : 'grid-cols-5'} no-print`}
       >
-        {[
+        {(storeType === 'lite' ? [{ id: 'pos' as const, label: 'Vender', icon: ShoppingCart }, { id: 'customers' as const, label: 'Clientes', icon: Users }, { id: 'inventory' as const, label: 'Estoque', icon: Boxes, badge: lowStockCount }, { id: 'pending' as const, label: 'Devendo', icon: Users }, { id: 'quick-report' as const, label: 'Relatório', icon: BarChart3 }] : [
           { id: 'dashboard' as const, label: 'Início', icon: LayoutDashboard },
           { id: 'pos' as const, label: 'Vender', icon: ShoppingCart },
           { id: 'accounts' as const, label: 'Clientes', icon: Users },
           { id: 'inventory' as const, label: 'Estoque', icon: Boxes, badge: lowStockCount },
-        ].map((item) => {
+        ]).map((item) => {
           const Icon = item.icon;
           const active = activeTab === item.id;
           return (
@@ -425,7 +437,7 @@ export default function App() {
           );
         })}
 
-        <button
+        {storeType !== 'lite' && <button
           onClick={() => setMoreSheetOpen(true)}
           className={`flex flex-col items-center justify-center gap-1 cursor-pointer transition-colors ${
             isMoreTabActive || moreSheetOpen ? 'text-emerald-700 font-semibold' : 'text-slate-500 hover:text-slate-800'
@@ -433,12 +445,12 @@ export default function App() {
         >
           <MoreHorizontal className="w-5 h-5" />
           <span className="text-[11px] leading-none">Mais</span>
-        </button>
+        </button>}
       </nav>
 
       {/* Mobile "Mais opções" Bottom Sheet */}
       <AnimatePresence>
-        {moreSheetOpen && (
+        {storeType !== 'lite' && moreSheetOpen && (
           <div className="lg:hidden fixed inset-0 z-50 flex flex-col justify-end no-print">
             <motion.div
               initial={{ opacity: 0 }}
@@ -471,6 +483,9 @@ export default function App() {
               </div>
 
               <div className="space-y-2">
+                <button onClick={() => { setActiveTab('quick-report'); setMoreSheetOpen(false); }} className="w-full rounded-2xl border border-slate-200 bg-white p-3.5 flex items-center justify-between gap-3 text-slate-800">
+                  <span className="flex items-center gap-3"><BarChart3 className="h-5 w-5 text-emerald-700"/><span className="text-left"><span className="block text-sm font-semibold">Vendas do mês</span><span className="block text-xs text-slate-500">Resumo rápido do mês atual</span></span></span><ChevronRight className="h-4 w-4 text-slate-400"/>
+                </button>
                 <button
                   onClick={() => {
                     setActiveTab('catalog');

@@ -11,6 +11,47 @@ const json = (value: unknown, status = 200) => Response.json(value, { status });
 const err = (message: string, status = 400) => json({ error: message }, status);
 const STORE_TABLES = ['products','price_history','employees','sales','sale_items','payments','stock_movements','period_closures','store_settings','loyalty_settings','auth_credentials'];
 
+const CACHE_TTL_MS = 15_000;
+const storeLookupCache = new Map<string, { store: ManagedStore; expires: number }>();
+const credentialVersionCache = new Map<string, { version: string; expires: number }>();
+const schemaReadyStores = new Set<number>();
+
+async function findStore(db: D1Database, slug: string): Promise<ManagedStore | null> {
+  const cached = storeLookupCache.get(slug);
+  if (cached && cached.expires > Date.now()) return cached.store;
+  const store = await first<ManagedStore>(db, 'SELECT id,slug,store_name,username,store_type,created_at FROM managed_stores WHERE slug=?', slug);
+  if (store) storeLookupCache.set(slug, { store, expires: Date.now() + CACHE_TTL_MS });
+  return store;
+}
+async function credentialVersion(db: D1Database, slug: string): Promise<string | null> {
+  const cached = credentialVersionCache.get(slug);
+  if (cached && cached.expires > Date.now()) return cached.version;
+  const row = await first<{ version: string }>(db, 'SELECT version FROM auth_credentials WHERE id=1');
+  if (row) credentialVersionCache.set(slug, { version: row.version, expires: Date.now() + CACHE_TTL_MS });
+  return row?.version ?? null;
+}
+function storeIndexStatements(db: D1Database, suffix: string) {
+  const defs: Array<[string, string, string]> = [
+    ['sales_employee', 'sales', 'employee_id'], ['sales_created', 'sales', 'created_at'], ['sales_status_employee', 'sales', 'status,employee_id'],
+    ['payments_employee', 'payments', 'employee_id'], ['payments_created', 'payments', 'created_at'],
+    ['sale_items_sale', 'sale_items', 'sale_id'], ['sale_items_product', 'sale_items', 'product_id'],
+    ['stock_movements_product', 'stock_movements', 'product_id'], ['price_history_product', 'price_history', 'product_id'],
+  ];
+  return defs.map(([name, table, cols]) => db.prepare(`CREATE INDEX IF NOT EXISTS idx_${name}${suffix} ON ${table}${suffix}(${cols})`));
+}
+async function ensureStoreSchema(rootDb: D1Database, store: ManagedStore) {
+  if (store.id === 1 || schemaReadyStores.has(store.id)) return;
+  try { await rootDb.prepare("ALTER TABLE managed_stores ADD COLUMN store_type TEXT NOT NULL DEFAULT 'complete' CHECK (store_type IN ('complete','lite'))").run(); } catch {}
+  const table = `sales__${store.id}`;
+  const schema = await first<{sql:string|null}>(rootDb, "SELECT sql FROM sqlite_master WHERE type='table' AND name=?", table);
+  if (schema?.sql && !schema.sql.includes('payment_status')) {
+    try { await rootDb.prepare(`ALTER TABLE ${table} ADD COLUMN payment_status TEXT NOT NULL DEFAULT 'untracked' CHECK (payment_status IN ('untracked','paid','pending'))`).run(); } catch {}
+    try { await rootDb.prepare(`ALTER TABLE ${table} ADD COLUMN paid_at TEXT`).run(); } catch {}
+  }
+  await rootDb.batch(storeIndexStatements(rootDb, `__${store.id}`));
+  schemaReadyStores.add(store.id);
+}
+
 function scopedDatabase(db: D1Database, storeId: number): D1Database {
   if (storeId === 1) return db;
   const names = STORE_TABLES.join('|');
@@ -84,8 +125,7 @@ async function isAuthenticated(req: Request, env: Env, storeSlug: string) {
   if(!cookie||!env.SESSION_SECRET)return false;
   const [expiration,version,signature]=cookie.split('.');
   if(!expiration||!version||!signature||Number(expiration)<Date.now())return false;
-  const credential=await first<{version:string}>(env.DB,'SELECT version FROM auth_credentials WHERE id=1');
-  if(!credential||credential.version!==version)return false;
+  if(await credentialVersion(env.DB,storeSlug)!==version)return false;
   const signed=await signSession(`${expiration}.${version}`,env.SESSION_SECRET);
   const expectedBytes=fromBase64Url(signed.split('.')[1]!),actualBytes=fromBase64Url(signature);
   if(expectedBytes.length!==actualBytes.length)return false;
@@ -134,10 +174,11 @@ async function changePassword(req: Request, env: Env, storeSlug: string) {
   if(next.length<12)return err('A nova senha deve ter pelo menos 12 caracteres.');
   if(next!==confirmation)return err('A confirmação da nova senha não confere.');
   const version=await saveCredential(env.DB,next,env.SESSION_SECRET);
+  credentialVersionCache.delete(storeSlug);
   return new Response(JSON.stringify({updated:true}),{headers:{'Content-Type':'application/json','Set-Cookie':await sessionCookie(version,env,storeSlug)}});
 }
 
-async function createSale(db: D1Database, input: { employee_id: number; items: Array<{ product_id: number; quantity: number }>; notes?: string; created_by?: string; corrected_from_sale_id?: number | null; stockCredits?: Map<number, number>; preStatements?: D1PreparedStatement[] }) {
+async function createSale(db: D1Database, input: { employee_id: number; items: Array<{ product_id: number; quantity: number }>; notes?: string; created_by?: string; payment_status?: 'paid' | 'pending'; corrected_from_sale_id?: number | null; stockCredits?: Map<number, number>; preStatements?: D1PreparedStatement[] }) {
   const employee = await first<{ id: number; name: string; active: number }>(db, 'SELECT id,name,active FROM employees WHERE id=?', input.employee_id);
   if (!employee) throw new Error('Cliente não encontrado.');
   if (!employee.active) throw new Error('Cliente está inativo.');
@@ -159,8 +200,8 @@ async function createSale(db: D1Database, input: { employee_id: number; items: A
   }
   const saleId = await newId(db, 'sales'), stamp = now(), actor = input.created_by || 'Administrador';
   const total = lines.reduce((sum, line) => sum + line.subtotal, 0);
-  const statements: D1PreparedStatement[] = [...(input.preStatements ?? []), db.prepare(`INSERT INTO sales(id,employee_id,total_cents,status,notes,corrected_from_sale_id,created_by,created_at)
-    VALUES(?,?,?,'active',?,?,?,?)`).bind(saleId, input.employee_id, total, input.notes?.trim() ?? '', input.corrected_from_sale_id ?? null, actor, stamp)];
+  const statements: D1PreparedStatement[] = [...(input.preStatements ?? []), db.prepare(`INSERT INTO sales(id,employee_id,total_cents,status,notes,corrected_from_sale_id,created_by,created_at,payment_status,paid_at)
+    VALUES(?,?,?,'active',?,?,?,?,?,?)`).bind(saleId, input.employee_id, total, input.notes?.trim() ?? '', input.corrected_from_sale_id ?? null, actor, stamp, input.payment_status ?? 'untracked', input.payment_status === 'paid' ? stamp : null)];
   for (const line of lines) {
     const after = line.before - line.qty;
     statements.push(db.prepare(`INSERT INTO sale_items(sale_id,product_id,product_name,quantity,unit_price_cents,subtotal_cents) VALUES(?,?,?,?,?,?)`)
@@ -174,19 +215,20 @@ async function createSale(db: D1Database, input: { employee_id: number; items: A
   return (await saleRows(db, row ? [row] : []))[0];
 }
 
-type ManagedStore = { id: number; slug: string; store_name: string; username: string; created_at: string };
+type ManagedStore = { id: number; slug: string; store_name: string; username: string; store_type: 'complete' | 'lite'; created_at: string };
 
 async function createManagedStore(db: D1Database, env: Env, data: Record<string, any>) {
   const storeName = String(data.store_name ?? '').trim().slice(0, 80);
   const slug = String(data.slug ?? '').trim().toLowerCase();
   const username = String(data.username ?? '').trim().toLowerCase();
   const password = String(data.password ?? '');
+  const storeType = data.store_type === 'lite' ? 'lite' : 'complete';
   if (!storeName) throw new Error('Informe o nome da loja.');
   if (!/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(slug) || slug === 'marlene' || slug === 'admin') throw new Error('Escolha um caminho válido e ainda não utilizado para a loja.');
   if (!username) throw new Error('Informe o login do responsável.');
   if (password.length < 12) throw new Error('A senha inicial deve ter pelo menos 12 caracteres.');
   const stamp = now();
-  const created = await db.prepare('INSERT INTO managed_stores(slug,store_name,username,created_at) VALUES(?,?,?,?)').bind(slug,storeName,username,stamp).run();
+  const created = await db.prepare('INSERT INTO managed_stores(slug,store_name,username,created_at,store_type) VALUES(?,?,?,?,?)').bind(slug,storeName,username,stamp,storeType).run();
   const storeId = Number(created.meta.last_row_id) || Number((await first<{id:number}>(db,'SELECT id FROM managed_stores WHERE slug=?',slug))?.id);
   const tableNames = [...STORE_TABLES];
   try {
@@ -197,6 +239,8 @@ async function createManagedStore(db: D1Database, env: Env, data: Record<string,
       for (const ref of tableNames) sql = sql.replace(new RegExp(`(REFERENCES\\s+)\\"?${ref}\\"?\\b`, 'gi'), (_match, prefix: string) => `${prefix}${ref}__${storeId}`);
       await run(db,sql);
     }
+    await db.batch(storeIndexStatements(db, `__${storeId}`));
+    schemaReadyStores.add(storeId);
     const scoped = scopedDatabase(db,storeId);
     await run(scoped,`INSERT INTO store_settings(id,store_name,logo_data_url,pix_key,pix_key_type,pix_beneficiary_name,pix_city,billing_message_template,brand_primary_color,brand_secondary_color,updated_at)
       VALUES(1,?,'','','auto',?,'SAO PAULO','', '#047857','#f59e0b',?)`,storeName,storeName.toUpperCase().slice(0,25),stamp);
@@ -208,7 +252,7 @@ async function createManagedStore(db: D1Database, env: Env, data: Record<string,
       await run(scoped,'INSERT INTO products(id,name,description,category,image_url,price_cents,stock,min_stock,available,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)',id,name,String(product.description??''),String(product.category??'Lanches & Bebidas'),String(product.image_url??''),price,stock,Math.max(0,Math.round(Number(product.min_stock??5))),product.available?1:0,stamp,stamp);
     }
     await saveCredential(scoped,password,env.SESSION_SECRET);
-    return { id:storeId,slug,store_name:storeName,username,created_at:stamp } satisfies ManagedStore;
+    return { id:storeId,slug,store_name:storeName,username,store_type:storeType,created_at:stamp } satisfies ManagedStore;
   } catch (error) {
     await run(db,'DELETE FROM managed_stores WHERE id=?',storeId);
     throw error;
@@ -244,15 +288,16 @@ async function handlePlatformApi(req: Request, env: Env): Promise<Response> {
   }
   if(path==='/api/admin/auth/logout'&&method==='POST')return new Response(JSON.stringify({authenticated:false}),{headers:{'Content-Type':'application/json','Set-Cookie':'platform_session=; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=0'}});
   if(!await isPlatformAuthenticated(req,env,db))return err('Faça login como administrador da plataforma.',401);
-  if(path==='/api/admin/stores'&&method==='GET')return json(await all<ManagedStore>(db,'SELECT id,slug,store_name,username,created_at FROM managed_stores ORDER BY id'));
+  if(path==='/api/admin/stores'&&method==='GET')return json(await all<ManagedStore>(db,'SELECT id,slug,store_name,username,store_type,created_at FROM managed_stores ORDER BY id'));
   if(path==='/api/admin/stores'&&method==='POST')return json(await createManagedStore(db,env,await body(req)),201);
   return err('Rota administrativa não encontrada.',404);
 }
 
 async function handleApi(req: Request, env: Env, store: ManagedStore, rootDb: D1Database): Promise<Response> {
+  await ensureStoreSchema(rootDb, store);
   const storeEnv = { ...env, DB: scopedDatabase(rootDb,store.id) } as Env;
   const db = storeEnv.DB, url = new URL(req.url), path = url.pathname, method = req.method;
-  const match = path.match(/^\/api\/(products|employees|sales)\/(\d+)(?:\/(stock|statement|cancel|correct))?$/);
+  const match = path.match(/^\/api\/(products|employees|sales)\/(\d+)(?:\/(stock|statement|cancel|correct|settle))?$/);
   try {
     if (path === '/api/store-info' && method === 'GET') return json(store);
     if (path === '/api/auth/status' && method === 'GET') return json({ authenticated: await isAuthenticated(req, storeEnv, store.slug) });
@@ -354,6 +399,8 @@ async function handleApi(req: Request, env: Env, store: ManagedStore, rootDb: D1
       return json(await first(db,'SELECT * FROM products WHERE id=?',id));
     }
     if (path === '/api/stock-movements' && method === 'GET') return json(await all(db,`SELECT sm.*,p.name product_name,p.category product_category FROM stock_movements sm JOIN products p ON p.id=sm.product_id ORDER BY sm.created_at DESC,sm.id DESC LIMIT 200`));
+    if (path === '/api/customers' && method === 'GET') return json(await all(db,`SELECT e.id,e.name,e.code,e.department,e.phone,e.email,e.active,e.created_at,COALESCE(s.total,0) total_consumed_cents,COALESCE(p.total,0) total_paid_cents,COALESCE(s.total,0)-COALESCE(p.total,0) balance_cents,MAX(s.last_sale,p.last_pay) last_activity_at FROM employees e LEFT JOIN (SELECT employee_id,SUM(total_cents) total,MAX(created_at) last_sale FROM sales WHERE status='active' GROUP BY employee_id)s ON s.employee_id=e.id LEFT JOIN (SELECT employee_id,SUM(amount_cents) total,MAX(created_at) last_pay FROM payments GROUP BY employee_id)p ON p.employee_id=e.id WHERE e.active=1 ORDER BY e.name COLLATE NOCASE`));
+    if (path === '/api/customers' && method === 'POST') { const d=await body(req), name=String(d.name??'').trim().slice(0,120); if(!name)return err('Informe o nome do cliente.'); const existing=await first<Row>(db,'SELECT id,name,code,department,phone,email,active,created_at FROM employees WHERE lower(trim(name))=lower(trim(?)) AND active=1 ORDER BY id LIMIT 1',name); if(existing)return json(existing); const id=await newId(db,'employees'),code=`L${id}`; await run(db,`INSERT INTO employees(id,name,code,department,phone,email,pin,active,created_at) VALUES(?,?,?,'','','','1234',1,?)`,id,name,code,now()); return json(await first(db,'SELECT id,name,code,department,phone,email,active,created_at FROM employees WHERE id=?',id),201); }
     if (path === '/api/employees' && method === 'GET') return json(await all(db,`SELECT e.id,e.name,e.code,e.department,e.phone,e.email,e.active,e.created_at,COALESCE(s.total,0) total_consumed_cents,COALESCE(p.total,0) total_paid_cents,COALESCE(s.total,0)-COALESCE(p.total,0) balance_cents,MAX(s.last_sale,p.last_pay) last_activity_at FROM employees e LEFT JOIN (SELECT employee_id,SUM(total_cents) total,MAX(created_at) last_sale FROM sales WHERE status='active' GROUP BY employee_id) s ON s.employee_id=e.id LEFT JOIN (SELECT employee_id,SUM(amount_cents) total,MAX(created_at) last_pay FROM payments GROUP BY employee_id) p ON p.employee_id=e.id ORDER BY e.name`));
     if (path === '/api/employees' && method === 'POST') {
       const d = await body(req); if (!String(d.name ?? '').trim()) return err('Nome do cliente é obrigatório.');
@@ -376,7 +423,9 @@ async function handleApi(req: Request, env: Env, store: ManagedStore, rootDb: D1
       return json({employee:{...emp,total_consumed_cents:consumed,total_paid_cents:paid,balance_cents:consumed-paid,last_activity_at:ledger.at(-1)?.created_at??null},ledger:ledger.reverse()});
     }
     if (path === '/api/sales' && method === 'GET') return json(await saleRows(db,await all(db,`${saleSelect} ORDER BY s.created_at DESC,s.id DESC LIMIT 200`)));
-    if (path === '/api/sales' && method === 'POST') { const d=await body(req); return json(await createSale(db,{employee_id:Number(d.employee_id),items:d.items,notes:String(d.notes??''),created_by:String(d.created_by??'Administrador')}),201); }
+    if (path === '/api/pending-sales' && method === 'GET') { if(store.store_type!=='lite')return err('Rota disponível apenas para lojas Lite.',404); return json(await saleRows(db,await all(db,`${saleSelect} WHERE s.status='active' AND s.payment_status='pending' ORDER BY s.created_at,s.id`))); }
+    if (path === '/api/sales' && method === 'POST') { const d=await body(req), payment_status=store.store_type==='lite'?(d.payment_status==='paid'?'paid':'pending'):undefined; return json(await createSale(db,{employee_id:Number(d.employee_id),items:d.items,notes:String(d.notes??''),created_by:String(d.created_by??'Administrador'),payment_status}),201); }
+    if (match && match[1] === 'sales' && match[3] === 'settle' && method === 'POST') { if(store.store_type!=='lite')return err('Quitação por venda disponível apenas para lojas Lite.',404); const id=Number(match[2]),sale=await first<Row>(db,"SELECT * FROM sales WHERE id=? AND status='active'",id); if(!sale)return err('Venda não encontrada ou inativa.',404); if(sale.payment_status!=='pending')return err('Esta venda não está pendente.',409); await run(db,"UPDATE sales SET payment_status='paid',paid_at=? WHERE id=? AND status='active' AND payment_status='pending'",now(),id); return json((await saleRows(db,await all(db,`${saleSelect} WHERE s.id=?`,id)))[0]); }
     if (match && match[1] === 'sales' && match[3] === 'cancel' && method === 'POST') {
       const id=Number(match[2]), d=await body(req), sale=await first<Row>(db,'SELECT * FROM sales WHERE id=?',id); if(!sale)return err('Venda não encontrada.'); if(sale.status!=='active')return err('Esta venda já foi cancelada ou corrigida anteriormente.');
       const items=await all<Row>(db,'SELECT * FROM sale_items WHERE sale_id=?',id), stamp=now(), actor=d.actor??'Administrador', reason=String(d.reason??'Cancelado pelo administrador').trim()||'Cancelamento administrativo'; const stmts:D1PreparedStatement[]=[];
@@ -410,8 +459,8 @@ async function handleApi(req: Request, env: Env, store: ManagedStore, rootDb: D1
       const payments=await all(db,'SELECT p.*,e.name employee_name FROM payments p JOIN employees e ON e.id=p.employee_id WHERE p.created_at>=? AND p.created_at<=? ORDER BY p.created_at DESC,p.id DESC',from,to);
       const movements=await all(db,'SELECT sm.*,p.name product_name,p.category product_category FROM stock_movements sm JOIN products p ON p.id=sm.product_id WHERE sm.created_at>=? AND sm.created_at<=? ORDER BY sm.created_at DESC,sm.id DESC',from,to);
       const top=await all(db,`SELECT si.product_id,si.product_name,COALESCE(p.category,'Outros') category,SUM(si.quantity) units_sold,SUM(si.subtotal_cents) revenue_cents FROM sale_items si JOIN sales s ON s.id=si.sale_id LEFT JOIN products p ON p.id=si.product_id WHERE s.status='active' AND s.created_at>=? AND s.created_at<=? GROUP BY si.product_id,si.product_name ORDER BY units_sold DESC,revenue_cents DESC`,from,to);
-      const emps=await all<Row>(db,'SELECT id,name,department FROM employees ORDER BY name'),cons=await all<Row>(db,"SELECT employee_id,SUM(total_cents) total,COUNT(*) cnt FROM sales WHERE status='active' AND created_at>=? AND created_at<=? GROUP BY employee_id",from,to),pay=await all<Row>(db,'SELECT employee_id,SUM(amount_cents) total FROM payments WHERE created_at>=? AND created_at<=? GROUP BY employee_id',from,to);
-      const consumption=[];let pending=0;for(const e of emps){const c=cons.find(r=>r.employee_id===e.id),p=pay.find(r=>r.employee_id===e.id),b=await balance(db,Number(e.id));if(b>0)pending+=b;consumption.push({employee_id:e.id,employee_name:e.name,department:e.department,period_consumed_cents:Number(c?.total??0),period_paid_cents:Number(p?.total??0),current_balance_cents:b,purchases_count:Number(c?.cnt??0)});}
+      const emps=await all<Row>(db,'SELECT id,name,department FROM employees ORDER BY name'),balanceRows=await all<{id:number;b:number}>(db,`SELECT e.id,COALESCE(s.total,0)-COALESCE(p.total,0) b FROM employees e LEFT JOIN (SELECT employee_id,SUM(total_cents) total FROM sales WHERE status='active' GROUP BY employee_id)s ON s.employee_id=e.id LEFT JOIN (SELECT employee_id,SUM(amount_cents) total FROM payments GROUP BY employee_id)p ON p.employee_id=e.id`),balanceById=new Map(balanceRows.map(r=>[Number(r.id),Number(r.b)])),cons=await all<Row>(db,"SELECT employee_id,SUM(total_cents) total,COUNT(*) cnt FROM sales WHERE status='active' AND created_at>=? AND created_at<=? GROUP BY employee_id",from,to),pay=await all<Row>(db,'SELECT employee_id,SUM(amount_cents) total FROM payments WHERE created_at>=? AND created_at<=? GROUP BY employee_id',from,to);
+      const consumption=[];let pending=0;for(const e of emps){const c=cons.find(r=>r.employee_id===e.id),p=pay.find(r=>r.employee_id===e.id),b=balanceById.get(Number(e.id))??0;if(b>0)pending+=b;consumption.push({employee_id:e.id,employee_name:e.name,department:e.department,period_consumed_cents:Number(c?.total??0),period_paid_cents:Number(p?.total??0),current_balance_cents:b,purchases_count:Number(c?.cnt??0)});}
       const active=sales.filter(s=>s.status==='active');return json({start_date:start,end_date:end,total_sales_cents:active.reduce((s,r)=>s+Number(r.total_cents),0),active_sales_count:active.length,cancelled_sales_count:sales.length-active.length,total_received_cents:payments.reduce((s,r)=>s+Number(r.amount_cents),0),payments_count:payments.length,overall_pending_cents:pending,employee_consumption:consumption,top_products:top,sales,payments,stock_movements:movements,closures:await all(db,'SELECT * FROM period_closures ORDER BY created_at DESC,id DESC LIMIT 20')});
     }
     if(path==='/api/closures'&&method==='POST'){
@@ -436,9 +485,10 @@ export default {
       const match=url.pathname.match(/^\/s\/([a-z0-9-]+)(\/.*)?$/);
       if(!match)return json({error:'Endereço de loja inválido.'},404);
       storeSlug=match[1]!;
-      const store=await first<ManagedStore>(env.DB,'SELECT id,slug,store_name,username,created_at FROM managed_stores WHERE slug=?',storeSlug);
+      const store=await findStore(env.DB,storeSlug);
       if(!store)return json({error:'Loja não encontrada.'},404);
       const remainder=match[2]??'';
+      if(remainder==='/manifest.webmanifest')return new Response(JSON.stringify({id:`/s/${storeSlug}/`,name:store.store_name,short_name:store.store_name.slice(0,24),description:'Gestão simples de vendas e estoque.',start_url:`/s/${storeSlug}/`,scope:`/s/${storeSlug}/`,display:'standalone',display_override:['standalone','minimal-ui'],orientation:'portrait-primary',background_color:'#f8fafc',theme_color:'#047857',icons:[{src:'/icons/icon-192.png',sizes:'192x192',type:'image/png',purpose:'any'},{src:'/icons/icon-512.png',sizes:'512x512',type:'image/png',purpose:'any'},{src:'/icons/icon-512.png',sizes:'512x512',type:'image/png',purpose:'maskable'}]}),{headers:{'Content-Type':'application/manifest+json; charset=utf-8','Cache-Control':'public, max-age=3600'}});
       if(remainder.startsWith('/api/')){
         url.pathname=remainder;
         apiRequest=new Request(url,request);
@@ -448,7 +498,7 @@ export default {
       return env.ASSETS.fetch(new Request(url,request));
     }
     if(url.pathname.startsWith('/api/')){
-      const store=await first<ManagedStore>(env.DB,'SELECT id,slug,store_name,username,created_at FROM managed_stores WHERE slug=?',storeSlug);
+      const store=await findStore(env.DB,storeSlug);
       if(!store)return json({error:'Loja não encontrada.'},404);
       return handleApi(apiRequest,env,store,env.DB);
     }

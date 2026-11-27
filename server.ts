@@ -48,6 +48,36 @@ function getEmployeeBalanceCents(employeeId: number): number {
   return Number(consumed.total) - Number(paid.total);
 }
 
+
+app.get('/api/store-info', (_req, res) => res.json({ id: 1, slug: 'local', store_name: 'Tem o quê?', username: 'local', store_type: process.env.LOCAL_STORE_TYPE === 'lite' ? 'lite' : 'complete', created_at: '' }));
+app.get('/api/customers', (_req, res) => {
+  const rows = db.prepare('SELECT id,name,code,department,phone,email,active,created_at FROM employees WHERE active=1 ORDER BY name COLLATE NOCASE').all() as Array<Record<string, unknown>>;
+  res.json(rows.map((row) => ({ ...row, total_consumed_cents: 0, total_paid_cents: 0, balance_cents: 0, last_activity_at: null })));
+});
+app.post('/api/customers', (req, res) => {
+  const name = String(req.body?.name ?? '').trim().slice(0, 120);
+  if (!name) return res.status(400).json({ error: 'Informe o nome do cliente.' });
+  const existing = db.prepare('SELECT id,name,code,department,phone,email,active,created_at FROM employees WHERE lower(trim(name))=lower(trim(?)) AND active=1 ORDER BY id LIMIT 1').get(name) as Record<string, unknown> | undefined;
+  if (existing) return res.json(existing);
+  const code = `L${Date.now()}${Math.floor(Math.random() * 1000)}`;
+  const now = getNowIso();
+  const info = db.prepare("INSERT INTO employees(name,code,department,phone,email,pin,active,created_at) VALUES(?,?, '', '', '', '1234',1,?)").run(name, code, now);
+  res.status(201).json(db.prepare('SELECT id,name,code,department,phone,email,active,created_at FROM employees WHERE id=?').get(Number(info.lastInsertRowid)));
+});
+app.get('/api/pending-sales', (_req, res) => {
+  const rows = db.prepare("SELECT s.*,e.name employee_name,e.department employee_department FROM sales s JOIN employees e ON e.id=s.employee_id WHERE s.status='active' AND s.payment_status='pending' ORDER BY s.created_at,s.id").all() as Array<Record<string, unknown>>;
+  res.json(attachSaleItems(rows));
+});
+app.post('/api/sales/:id/settle', (req, res) => {
+  const id = Number(req.params.id);
+  const sale = db.prepare("SELECT * FROM sales WHERE id=? AND status='active'").get(id) as Record<string, unknown> | undefined;
+  if (!sale) return res.status(404).json({ error: 'Venda não encontrada ou inativa.' });
+  if (sale.payment_status !== 'pending') return res.status(409).json({ error: 'Esta venda não está pendente.' });
+  db.prepare("UPDATE sales SET payment_status='paid',paid_at=? WHERE id=? AND status='active' AND payment_status='pending'").run(getNowIso(), id);
+  const row = db.prepare('SELECT s.*,e.name employee_name,e.department employee_department FROM sales s JOIN employees e ON e.id=s.employee_id WHERE s.id=?').get(id) as Record<string, unknown>;
+  res.json(attachSaleItems([row])[0]);
+});
+
 // Store Settings (Logo, Pix Key, Billing Template)
 app.get('/api/settings', (_req, res) => {
   try {
@@ -724,6 +754,7 @@ function createSaleInternal(params: {
   notes: string;
   createdBy: string;
   correctedFromSaleId?: number | null;
+  paymentStatus?: 'untracked' | 'paid' | 'pending';
 }) {
   const { employeeId, items, notes, createdBy, correctedFromSaleId = null } = params;
   const employee = db.prepare(`SELECT id, name, active FROM employees WHERE id = ?`).get(employeeId) as { id: number; name: string; active: number } | undefined;
@@ -779,10 +810,10 @@ function createSaleInternal(params: {
 
   const saleRes = db
     .prepare(`
-      INSERT INTO sales (employee_id, total_cents, status, notes, corrected_from_sale_id, created_by, created_at)
-      VALUES (?, ?, 'active', ?, ?, ?, ?)
+      INSERT INTO sales (employee_id, total_cents, status, notes, corrected_from_sale_id, created_by, created_at, payment_status, paid_at)
+      VALUES (?, ?, 'active', ?, ?, ?, ?, ?, ?)
     `)
-    .run(employeeId, totalCents, notes.trim(), correctedFromSaleId, createdBy, now);
+    .run(employeeId, totalCents, notes.trim(), correctedFromSaleId, createdBy, now, params.paymentStatus ?? 'untracked', params.paymentStatus === 'paid' ? now : null);
   const saleId = Number(saleRes.lastInsertRowid);
 
   for (const item of resolved) {
@@ -819,6 +850,7 @@ app.post('/api/sales', (req, res) => {
         items,
         notes: String(notes),
         createdBy: String(created_by),
+        paymentStatus: req.body.payment_status === 'paid' ? 'paid' : req.body.payment_status === 'pending' ? 'pending' : 'untracked',
       })
     );
     res.status(201).json(sale);

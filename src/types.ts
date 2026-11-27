@@ -1,4 +1,5 @@
 export type SaleStatus = 'active' | 'cancelled' | 'corrected';
+export type StoreType = 'complete' | 'lite';
 export type StockMovementType = 'entry' | 'sale' | 'sale_reversal' | 'adjustment';
 export type PaymentMethod = 'Pix' | 'Dinheiro' | 'Desconto em Folha' | 'Transferência';
 export type PixKeyType = 'auto' | 'telefone' | 'cpf_cnpj' | 'email' | 'aleatoria';
@@ -107,6 +108,8 @@ export interface Sale {
   created_at: string;
   cancelled_at: string | null;
   cancel_reason: string | null;
+  payment_status?: 'untracked' | 'paid' | 'pending';
+  paid_at?: string | null;
   items: SaleItem[];
 }
 

@@ -77,7 +77,9 @@ export function initDatabase() {
       created_by TEXT NOT NULL DEFAULT 'Administrador',
       created_at TEXT NOT NULL,
       cancelled_at TEXT,
-      cancel_reason TEXT
+      cancel_reason TEXT,
+      payment_status TEXT NOT NULL DEFAULT 'untracked' CHECK (payment_status IN ('untracked','paid','pending')),
+      paid_at TEXT
     );
 
     CREATE TABLE IF NOT EXISTS sale_items (
@@ -166,6 +168,10 @@ export function initDatabase() {
     CREATE INDEX IF NOT EXISTS idx_stock_movements_product ON stock_movements(product_id);
     CREATE INDEX IF NOT EXISTS idx_price_history_product ON price_history(product_id);
   `);
+
+  const saleColumns = new Set((db.prepare('PRAGMA table_info(sales)').all() as Array<{ name: string }>).map((column) => column.name));
+  if (!saleColumns.has('payment_status')) db.exec("ALTER TABLE sales ADD COLUMN payment_status TEXT NOT NULL DEFAULT 'untracked' CHECK (payment_status IN ('untracked','paid','pending'))");
+  if (!saleColumns.has('paid_at')) db.exec('ALTER TABLE sales ADD COLUMN paid_at TEXT');
 
   const storeSettingColumns = new Set((db.prepare('PRAGMA table_info(store_settings)').all() as Array<{ name: string }>).map((column) => column.name));
   if (!storeSettingColumns.has('brand_primary_color')) db.exec("ALTER TABLE store_settings ADD COLUMN brand_primary_color TEXT NOT NULL DEFAULT '#047857'");
