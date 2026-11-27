@@ -7,7 +7,7 @@ declare global {
 }
 
 const now = () => new Date().toISOString();
-const json = (value: unknown, status = 200) => Response.json(value, { status });
+const json = (value: unknown, status = 200) => Response.json(value, { status, headers: { 'Cache-Control': 'private, no-store' } });
 const err = (message: string, status = 400) => json({ error: message }, status);
 const STORE_TABLES = ['products','price_history','employees','sales','sale_items','payments','stock_movements','period_closures','store_settings','loyalty_settings','auth_credentials'];
 
@@ -50,6 +50,60 @@ async function ensureStoreSchema(rootDb: D1Database, store: ManagedStore) {
   }
   await rootDb.batch(storeIndexStatements(rootDb, `__${store.id}`));
   schemaReadyStores.add(store.id);
+}
+
+const EMPLOYEES_SQL = `SELECT e.id,e.name,e.code,e.department,e.phone,e.email,e.active,e.created_at,COALESCE(s.total,0) total_consumed_cents,COALESCE(p.total,0) total_paid_cents,COALESCE(s.total,0)-COALESCE(p.total,0) balance_cents,MAX(s.last_sale,p.last_pay) last_activity_at FROM employees e LEFT JOIN (SELECT employee_id,SUM(total_cents) total,MAX(created_at) last_sale FROM sales WHERE status='active' GROUP BY employee_id) s ON s.employee_id=e.id LEFT JOIN (SELECT employee_id,SUM(amount_cents) total,MAX(created_at) last_pay FROM payments GROUP BY employee_id) p ON p.employee_id=e.id ORDER BY e.name`;
+const DASHBOARD_BALANCES_SQL = `SELECT COALESCE(s.total,0)-COALESCE(p.total,0) balance FROM employees e LEFT JOIN (SELECT employee_id,SUM(total_cents) total FROM sales WHERE status='active' GROUP BY employee_id)s ON s.employee_id=e.id LEFT JOIN (SELECT employee_id,SUM(amount_cents) total FROM payments GROUP BY employee_id)p ON p.employee_id=e.id`;
+const DASHBOARD_TOP_SQL = `SELECT si.product_id,si.product_name,COALESCE(p.category,'Outros') category,SUM(si.quantity) units_sold,SUM(si.subtotal_cents) revenue_cents FROM sale_items si JOIN sales s ON s.id=si.sale_id LEFT JOIN products p ON p.id=si.product_id WHERE s.status='active' GROUP BY si.product_id,si.product_name ORDER BY units_sold DESC,revenue_cents DESC LIMIT 6`;
+const RECENT_PAYMENTS_SQL = 'SELECT p.*,e.name employee_name FROM payments p JOIN employees e ON e.id=p.employee_id ORDER BY p.created_at DESC,p.id DESC LIMIT 6';
+const RECENT_SALES_LIMIT = 200;
+
+async function readDataVersion(rootDb: D1Database, storeId: number): Promise<number | null> {
+  try { return Number((await first<{ version: number }>(rootDb, 'SELECT version FROM store_data_version WHERE store_id=?', storeId))?.version ?? 0); } catch { return null; }
+}
+async function bumpDataVersion(rootDb: D1Database, storeId: number) {
+  try { await run(rootDb, 'INSERT INTO store_data_version(store_id,version) VALUES(?,1) ON CONFLICT(store_id) DO UPDATE SET version=version+1', storeId); } catch {}
+}
+
+/** Tudo que o app precisa para abrir, em uma chamada e uma ida ao D1. Responde só `unchanged` se a versão bater. */
+async function bootstrap(rootDb: D1Database, db: D1Database, storeId: number, since: string | null) {
+  const version = await readDataVersion(rootDb, storeId);
+  if (version !== null && since !== null && Number(since) === version) return { unchanged: true, version };
+  const [rev, paid, balances, low, top, payments, products, employees, sales, items, settings, loyalty] = await db.batch([
+    db.prepare("SELECT COALESCE(SUM(total_cents),0) total FROM sales WHERE status='active'"),
+    db.prepare('SELECT COALESCE(SUM(amount_cents),0) total FROM payments'),
+    db.prepare(DASHBOARD_BALANCES_SQL),
+    db.prepare('SELECT * FROM products WHERE stock<=min_stock ORDER BY stock,name'),
+    db.prepare(DASHBOARD_TOP_SQL),
+    db.prepare(RECENT_PAYMENTS_SQL),
+    db.prepare('SELECT * FROM products ORDER BY category,name'),
+    db.prepare(EMPLOYEES_SQL),
+    db.prepare(`${saleSelect} ORDER BY s.created_at DESC,s.id DESC LIMIT ${RECENT_SALES_LIMIT}`),
+    db.prepare(`SELECT * FROM sale_items WHERE sale_id IN (SELECT id FROM sales ORDER BY created_at DESC,id DESC LIMIT ${RECENT_SALES_LIMIT}) ORDER BY id`),
+    db.prepare('SELECT * FROM store_settings WHERE id=1'),
+    db.prepare('SELECT * FROM loyalty_settings WHERE id=1'),
+  ]);
+  const itemsBySale = new Map<number, Row[]>();
+  for (const item of items!.results as Row[]) itemsBySale.set(Number(item.sale_id), [...(itemsBySale.get(Number(item.sale_id)) ?? []), item]);
+  const saleList = (sales!.results as Row[]).map((sale) => ({ ...sale, items: itemsBySale.get(Number(sale.id)) ?? [] }));
+  const balanceRows = balances!.results as Array<{ balance: number }>;
+  const revenue = Number((rev!.results[0] as { total: number } | undefined)?.total ?? 0);
+  return {
+    version,
+    products: products!.results,
+    employees: employees!.results,
+    sales: saleList,
+    settings: settings!.results[0] ?? null,
+    loyalty: loyalty!.results[0] ?? null,
+    summary: {
+      total_revenue_cents: revenue, total_credit_sales_cents: revenue,
+      total_received_cents: Number((paid!.results[0] as { total: number } | undefined)?.total ?? 0),
+      total_pending_cents: balanceRows.reduce((sum, r) => sum + Math.max(0, Number(r.balance)), 0),
+      debtors_count: balanceRows.filter((r) => Number(r.balance) > 0).length,
+      low_stock_products: low!.results, top_products: top!.results,
+      recent_sales: saleList.slice(0, 6), recent_payments: payments!.results,
+    },
+  };
 }
 
 function scopedDatabase(db: D1Database, storeId: number): D1Database {
@@ -294,6 +348,12 @@ async function handlePlatformApi(req: Request, env: Env): Promise<Response> {
 }
 
 async function handleApi(req: Request, env: Env, store: ManagedStore, rootDb: D1Database): Promise<Response> {
+  const response = await routeApi(req, env, store, rootDb);
+  if (req.method !== 'GET' && response.ok && !new URL(req.url).pathname.startsWith('/api/auth/')) await bumpDataVersion(rootDb, store.id);
+  return response;
+}
+
+async function routeApi(req: Request, env: Env, store: ManagedStore, rootDb: D1Database): Promise<Response> {
   await ensureStoreSchema(rootDb, store);
   const storeEnv = { ...env, DB: scopedDatabase(rootDb,store.id) } as Env;
   const db = storeEnv.DB, url = new URL(req.url), path = url.pathname, method = req.method;
@@ -305,6 +365,7 @@ async function handleApi(req: Request, env: Env, store: ManagedStore, rootDb: D1
     if (path === '/api/auth/logout' && method === 'POST') return new Response(JSON.stringify({ authenticated: false }), { headers: { 'Content-Type': 'application/json', 'Set-Cookie': `${sessionCookieName(store.slug)}=; Path=${sessionCookiePath(store.slug)}; HttpOnly; Secure; SameSite=Strict; Max-Age=0` } });
     if (!await isAuthenticated(req, storeEnv, store.slug)) return err('Faça login para acessar os dados da loja.', 401);
     if (path === '/api/auth/password' && method === 'POST') return changePassword(req, storeEnv,store.slug);
+    if (path === '/api/bootstrap' && method === 'GET') return json(await bootstrap(rootDb, db, store.id, url.searchParams.get('since')));
     if (path === '/api/settings' && method === 'GET') return json(await first(db, 'SELECT * FROM store_settings WHERE id=1'));
     if (path === '/api/settings' && method === 'PUT') {
       const data = await body(req), old = await first<Row>(db, 'SELECT * FROM store_settings WHERE id=1') ?? {};
@@ -401,7 +462,7 @@ async function handleApi(req: Request, env: Env, store: ManagedStore, rootDb: D1
     if (path === '/api/stock-movements' && method === 'GET') return json(await all(db,`SELECT sm.*,p.name product_name,p.category product_category FROM stock_movements sm JOIN products p ON p.id=sm.product_id ORDER BY sm.created_at DESC,sm.id DESC LIMIT 200`));
     if (path === '/api/customers' && method === 'GET') return json(await all(db,`SELECT e.id,e.name,e.code,e.department,e.phone,e.email,e.active,e.created_at,COALESCE(s.total,0) total_consumed_cents,COALESCE(p.total,0) total_paid_cents,COALESCE(s.total,0)-COALESCE(p.total,0) balance_cents,MAX(s.last_sale,p.last_pay) last_activity_at FROM employees e LEFT JOIN (SELECT employee_id,SUM(total_cents) total,MAX(created_at) last_sale FROM sales WHERE status='active' GROUP BY employee_id)s ON s.employee_id=e.id LEFT JOIN (SELECT employee_id,SUM(amount_cents) total,MAX(created_at) last_pay FROM payments GROUP BY employee_id)p ON p.employee_id=e.id WHERE e.active=1 ORDER BY e.name COLLATE NOCASE`));
     if (path === '/api/customers' && method === 'POST') { const d=await body(req), name=String(d.name??'').trim().slice(0,120); if(!name)return err('Informe o nome do cliente.'); const existing=await first<Row>(db,'SELECT id,name,code,department,phone,email,active,created_at FROM employees WHERE lower(trim(name))=lower(trim(?)) AND active=1 ORDER BY id LIMIT 1',name); if(existing)return json(existing); const id=await newId(db,'employees'),code=`L${id}`; await run(db,`INSERT INTO employees(id,name,code,department,phone,email,pin,active,created_at) VALUES(?,?,?,'','','','1234',1,?)`,id,name,code,now()); return json(await first(db,'SELECT id,name,code,department,phone,email,active,created_at FROM employees WHERE id=?',id),201); }
-    if (path === '/api/employees' && method === 'GET') return json(await all(db,`SELECT e.id,e.name,e.code,e.department,e.phone,e.email,e.active,e.created_at,COALESCE(s.total,0) total_consumed_cents,COALESCE(p.total,0) total_paid_cents,COALESCE(s.total,0)-COALESCE(p.total,0) balance_cents,MAX(s.last_sale,p.last_pay) last_activity_at FROM employees e LEFT JOIN (SELECT employee_id,SUM(total_cents) total,MAX(created_at) last_sale FROM sales WHERE status='active' GROUP BY employee_id) s ON s.employee_id=e.id LEFT JOIN (SELECT employee_id,SUM(amount_cents) total,MAX(created_at) last_pay FROM payments GROUP BY employee_id) p ON p.employee_id=e.id ORDER BY e.name`));
+    if (path === '/api/employees' && method === 'GET') return json(await all(db,EMPLOYEES_SQL));
     if (path === '/api/employees' && method === 'POST') {
       const d = await body(req); if (!String(d.name ?? '').trim()) return err('Nome do cliente é obrigatório.');
       const id = await newId(db,'employees'), code = String(d.code ?? `F${crypto.getRandomValues(new Uint16Array(1))[0]! % 900 + 100}`).trim().toUpperCase();
@@ -446,9 +507,9 @@ async function handleApi(req: Request, env: Env, store: ManagedStore, rootDb: D1
     }
     if (path === '/api/dashboard' && method === 'GET') {
       const rev=await first<{total:number}>(db,"SELECT COALESCE(SUM(total_cents),0) total FROM sales WHERE status='active'"),paid=await first<{total:number}>(db,'SELECT COALESCE(SUM(amount_cents),0) total FROM payments');
-      const balances=await all<{balance:number}>(db,`SELECT COALESCE(s.total,0)-COALESCE(p.total,0) balance FROM employees e LEFT JOIN (SELECT employee_id,SUM(total_cents) total FROM sales WHERE status='active' GROUP BY employee_id)s ON s.employee_id=e.id LEFT JOIN (SELECT employee_id,SUM(amount_cents) total FROM payments GROUP BY employee_id)p ON p.employee_id=e.id`);
+      const balances=await all<{balance:number}>(db,DASHBOARD_BALANCES_SQL);
       const low=await all(db,'SELECT * FROM products WHERE stock<=min_stock ORDER BY stock,name');
-      const top=await all(db,`SELECT si.product_id,si.product_name,COALESCE(p.category,'Outros') category,SUM(si.quantity) units_sold,SUM(si.subtotal_cents) revenue_cents FROM sale_items si JOIN sales s ON s.id=si.sale_id LEFT JOIN products p ON p.id=si.product_id WHERE s.status='active' GROUP BY si.product_id,si.product_name ORDER BY units_sold DESC,revenue_cents DESC LIMIT 6`);
+      const top=await all(db,DASHBOARD_TOP_SQL);
       const sr=await all(db,`${saleSelect} ORDER BY s.created_at DESC,s.id DESC LIMIT 6`),payments=await all(db,'SELECT p.*,e.name employee_name FROM payments p JOIN employees e ON e.id=p.employee_id ORDER BY p.created_at DESC,p.id DESC LIMIT 6');
       const pending=balances.reduce((sum,r)=>sum+Math.max(0,Number(r.balance)),0);
       return json({total_revenue_cents:Number(rev?.total??0),total_credit_sales_cents:Number(rev?.total??0),total_received_cents:Number(paid?.total??0),total_pending_cents:pending,debtors_count:balances.filter(r=>Number(r.balance)>0).length,low_stock_products:low,top_products:top,recent_sales:await saleRows(db,sr),recent_payments:payments});

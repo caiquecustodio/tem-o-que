@@ -30,6 +30,21 @@ export function apiUrl(path: string) {
   return `${getStorePathPrefix()}${path.startsWith('/api/') ? path : `/api${path.startsWith('/') ? path : `/${path}`}`}`;
 }
 
+export class ApiError extends Error {
+  constructor(message: string, readonly status: number) { super(message); }
+}
+
+export interface BootstrapData {
+  version: number | null;
+  summary: DashboardSummary;
+  products: Product[];
+  employees: Employee[];
+  sales: Sale[];
+  settings: StoreSettings | null;
+  loyalty: LoyaltySettings | null;
+}
+export type BootstrapResponse = BootstrapData | { unchanged: true; version: number | null };
+
 async function request<T>(url: string, options?: RequestInit): Promise<T> {
   const targetUrl = url.startsWith('/api/') ? apiUrl(url) : url;
   const res = await fetch(targetUrl, {
@@ -41,12 +56,13 @@ async function request<T>(url: string, options?: RequestInit): Promise<T> {
   });
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {
-    throw new Error((data as { error?: string }).error || `Erro na requisição (${res.status})`);
+    throw new ApiError((data as { error?: string }).error || `Erro na requisição (${res.status})`, res.status);
   }
   return data as T;
 }
 
 export const api = {
+  getBootstrap: (since: number | null) => request<BootstrapResponse>(since === null ? '/api/bootstrap' : `/api/bootstrap?since=${since}`),
   getStoreInfo: () => request<StoreInfo>('/api/store-info'),
   getCustomers: () => request<Employee[]>('/api/customers'),
   createCustomer: (name: string) => request<Employee>('/api/customers', { method: 'POST', body: JSON.stringify({ name }) }),

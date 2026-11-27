@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { lazy, Suspense, useCallback, useEffect, useRef, useState } from 'react';
 import type { CSSProperties } from 'react';
 import {
   BarChart3,
@@ -17,20 +17,23 @@ import {
   X,
 } from 'lucide-react';
 import { AnimatePresence, motion } from 'motion/react';
-import { api, apiUrl } from './api/client';
+import { ApiError, api, apiUrl, getStoreSlugFromPath } from './api/client';
+import type { BootstrapData } from './api/client';
+import { localCache } from './api/localCache';
 import type { DashboardSummary, Employee, LoyaltySettings, Product, Sale, StoreSettings, StoreType } from './types';
 import { DEFAULT_BILLING_TEMPLATE } from './utils/pix';
-import { DashboardView } from './components/DashboardView';
-import { PosSalesView } from './components/PosSalesView';
-import { CatalogView } from './components/CatalogView';
-import { AccountsView } from './components/AccountsView';
-import { InventoryView } from './components/InventoryView';
-import { ReportsView } from './components/ReportsView';
-import { SettingsView } from './components/SettingsView';
-import { MenuView } from './components/MenuView';
-import { PendingSalesView } from './components/PendingSalesView';
-import { LiteCustomersView } from './components/LiteCustomersView';
-import { QuickMonthlySalesView } from './components/QuickMonthlySalesView';
+const lazyView = <K extends string>(load: () => Promise<Record<K, React.ComponentType<any>>>, name: K) => lazy(() => load().then((module) => ({ default: module[name] })));
+const DashboardView = lazyView(() => import('./components/DashboardView'), 'DashboardView');
+const PosSalesView = lazyView(() => import('./components/PosSalesView'), 'PosSalesView');
+const CatalogView = lazyView(() => import('./components/CatalogView'), 'CatalogView');
+const AccountsView = lazyView(() => import('./components/AccountsView'), 'AccountsView');
+const InventoryView = lazyView(() => import('./components/InventoryView'), 'InventoryView');
+const ReportsView = lazyView(() => import('./components/ReportsView'), 'ReportsView');
+const SettingsView = lazyView(() => import('./components/SettingsView'), 'SettingsView');
+const MenuView = lazyView(() => import('./components/MenuView'), 'MenuView');
+const PendingSalesView = lazyView(() => import('./components/PendingSalesView'), 'PendingSalesView');
+const LiteCustomersView = lazyView(() => import('./components/LiteCustomersView'), 'LiteCustomersView');
+const QuickMonthlySalesView = lazyView(() => import('./components/QuickMonthlySalesView'), 'QuickMonthlySalesView');
 
 type AdminTab = 'dashboard' | 'pos' | 'catalog' | 'accounts' | 'inventory' | 'menu' | 'reports' | 'settings' | 'pending' | 'customers' | 'quick-report';
 
@@ -146,40 +149,71 @@ export default function App() {
   const [quickPayEmployeeId, setQuickPayEmployeeId] = useState<number | null>(null);
   const [restockProductId, setRestockProductId] = useState<number | null>(null);
 
+  const cacheKey = `bootstrap:${getStoreSlugFromPath()}`;
+  const dataVersionRef = useRef<number | null>(null);
+  const hasDataRef = useRef(false);
+
+  const applyBootstrap = useCallback((data: BootstrapData) => {
+    setSummary(data.summary);
+    setProducts(data.products);
+    setEmployees(data.employees);
+    setSales(data.sales);
+    if (data.settings) setStoreSettings(data.settings);
+    setLoyaltySettings(data.loyalty);
+    dataVersionRef.current = data.version;
+    hasDataRef.current = true;
+  }, []);
+
   const refreshAll = useCallback(async () => {
     setLoadError(null);
     try {
-      const [dash, prods, emps, sls, stgs, loyalty] = await Promise.all([
-        api.getDashboard(),
-        api.getProducts(),
-        api.getEmployees(),
-        api.getSales(),
-        api.getSettings(),
-        api.getLoyaltySettings(),
-      ]);
-      setSummary(dash);
-      setProducts(prods);
-      setEmployees(emps);
-      setSales(sls);
-      if (stgs) {
-        setStoreSettings(stgs);
+      const data = await api.getBootstrap(dataVersionRef.current);
+      if ('unchanged' in data) {
+        dataVersionRef.current = data.version;
+      } else {
+        applyBootstrap(data);
+        void localCache.set(cacheKey, data);
       }
-      setLoyaltySettings(loyalty);
     } catch (err) {
-      setLoadError((err as Error).message || 'Falha ao conectar com o banco local SQLite.');
+      if (err instanceof ApiError && err.status === 401) {
+        hasDataRef.current = false;
+        dataVersionRef.current = null;
+        void localCache.clear();
+        setAuthenticated(false);
+      } else if (!hasDataRef.current) {
+        setLoadError((err as Error).message || 'Falha ao conectar com o servidor.');
+      }
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [applyBootstrap, cacheKey]);
 
   useEffect(() => {
+    let cancelled = false;
+    let confirmedLoggedOut = false;
     api.getStoreInfo().then((data) => { const type = data.store_type ?? 'complete'; setStoreType(type); if (type === 'lite') setActiveTab('pos'); if (data.store_name) setStoreSettings((current) => ({ ...current, store_name: data.store_name })); }).catch(() => undefined);
-    fetch(apiUrl('/api/auth/status')).then((res) => res.json() as Promise<{ authenticated?: boolean }>).then((data) => setAuthenticated(Boolean(data.authenticated)))
-      .catch(() => setAuthenticated(false)).finally(() => setAuthReady(true));
-  }, []);
+    // Abre na hora com o último estado salvo e revalida em segundo plano.
+    void localCache.get<BootstrapData>(cacheKey).then((cached) => {
+      if (cancelled || confirmedLoggedOut || !cached?.summary) return;
+      applyBootstrap(cached);
+      setAuthenticated(true);
+      setAuthReady(true);
+      setLoading(false);
+    });
+    fetch(apiUrl('/api/auth/status')).then((res) => res.json() as Promise<{ authenticated?: boolean }>).then((data) => {
+      if (!data.authenticated) { confirmedLoggedOut = true; hasDataRef.current = false; dataVersionRef.current = null; void localCache.clear(); }
+      setAuthenticated(Boolean(data.authenticated));
+    }).catch(() => { if (!hasDataRef.current) setAuthenticated(false); }).finally(() => setAuthReady(true));
+    return () => { cancelled = true; };
+  }, [applyBootstrap, cacheKey]);
 
   useEffect(() => {
-    if (authenticated) refreshAll();
+    if (!authenticated) return;
+    void refreshAll();
+    const revalidate = () => { if (document.visibilityState === 'visible') void refreshAll(); };
+    const timer = window.setInterval(revalidate, 60_000);
+    document.addEventListener('visibilitychange', revalidate);
+    return () => { window.clearInterval(timer); document.removeEventListener('visibilitychange', revalidate); };
   }, [refreshAll, authenticated]);
 
   const handleNavigateFromDashboard = (tab: 'pos' | 'accounts' | 'inventory' | 'reports', employeeId?: number) => {
@@ -312,7 +346,7 @@ export default function App() {
 
           <div className="flex items-center gap-2.5 shrink-0">
             <button
-              onClick={async () => { const response = await fetch(apiUrl('/api/auth/logout'), { method: 'POST' }); const data = await response.json() as { authenticated?: boolean }; setAuthenticated(Boolean(data.authenticated)); }}
+              onClick={async () => { const response = await fetch(apiUrl('/api/auth/logout'), { method: 'POST' }); const data = await response.json() as { authenticated?: boolean }; if (!data.authenticated) { hasDataRef.current = false; dataVersionRef.current = null; await localCache.clear(); } setAuthenticated(Boolean(data.authenticated)); }}
               className="min-h-[38px] px-2.5 sm:px-3 rounded-xl text-xs font-medium text-slate-600 hover:bg-slate-100 inline-flex items-center gap-1.5 cursor-pointer"
               aria-label="Sair da conta"
             >
@@ -343,7 +377,7 @@ export default function App() {
               </button>
             </div>
           ) : (
-            <>
+            <Suspense fallback={<p className="p-8 text-center text-sm text-slate-500">Carregando…</p>}>
               {storeType !== 'lite' && activeTab === 'dashboard' && (
                 <DashboardView
                   summary={summary}
@@ -395,7 +429,7 @@ export default function App() {
               {storeType !== 'lite' && activeTab === 'settings' && (
                 <SettingsView settings={storeSettings} loyaltySettings={loyaltySettings} products={products} onSettingsUpdated={setStoreSettings} onLoyaltySettingsUpdated={setLoyaltySettings} />
               )}
-            </>
+            </Suspense>
           )}
         </main>
       </div>

@@ -1,4 +1,4 @@
-const CACHE_NAME = "tem-o-que-shell-v1";
+const CACHE_NAME = "tem-o-que-shell-v2";
 const STATIC_DESTINATIONS = new Set(["style", "script", "image", "font", "manifest"]);
 
 self.addEventListener("install", (event) => {
@@ -19,14 +19,22 @@ self.addEventListener("fetch", (event) => {
   if (request.method !== "GET" || url.origin !== self.location.origin || url.pathname.startsWith("/api/")) return;
 
   if (request.mode === "navigate") {
+    // Shell do app: responde do cache na hora e atualiza em segundo plano (os dados vêm da API, não do HTML).
     event.respondWith((async () => {
       const cache = await caches.open(CACHE_NAME);
-      try {
-        const response = await fetch(request);
-        if (response.ok) await cache.put(request, response.clone());
+      const cached = await cache.match(request);
+      const update = fetch(request).then((response) => {
+        if (response.ok) void cache.put(request, response.clone());
         return response;
+      });
+      if (cached) {
+        event.waitUntil(update.catch(() => undefined));
+        return cached;
+      }
+      try {
+        return await update;
       } catch {
-        return (await cache.match(request)) || new Response("Sem conexão. Abra o app quando a internet voltar para atualizar seus dados.", { status: 503, headers: { "Content-Type": "text/plain; charset=utf-8" } });
+        return new Response("Sem conexão. Abra o app quando a internet voltar para atualizar seus dados.", { status: 503, headers: { "Content-Type": "text/plain; charset=utf-8" } });
       }
     })());
     return;
