@@ -216,3 +216,51 @@ export interface PeriodReport {
   stock_movements: StockMovement[];
   closures: PeriodClosure[];
 }
+
+export type OrderStatus = 'pending_review' | 'approved' | 'delivered' | 'rejected' | 'cancelled';
+
+export interface OrderItem {
+  id: number;
+  order_id: number;
+  product_id: number;
+  offer_id: number | null;
+  product_name: string;
+  quantity: number;
+  unit_price_cents: number;
+}
+
+export interface Order {
+  id: number;
+  employee_id: number;
+  employee_name?: string;
+  employee_phone?: string;
+  status: OrderStatus;
+  payment_choice: 'later' | 'pix_now';
+  payment_state: 'none' | 'claimed' | 'confirmed';
+  total_cents: number;
+  notes: string;
+  sale_id: number | null;
+  created_at: string;
+  items: OrderItem[];
+}
+
+export interface ReservationOffer {
+  id: number;
+  product_id: number;
+  product_name: string;
+  price_cents: number;
+  service_date: string | null;
+  limit_qty: number | null;
+  closes_at: string | null;
+  status: 'open' | 'closed';
+  reserved_qty: number;
+}
+
+export interface ProductionRow {
+  product_id: number;
+  product_name: string;
+  service_date: string | null;
+  quantity: number;
+  pending_quantity: number;
+  orders_count: number;
+}

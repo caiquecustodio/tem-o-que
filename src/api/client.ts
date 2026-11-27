@@ -4,12 +4,15 @@ import type {
   EmployeeStatement,
   LoyaltyProgress,
   LoyaltySettings,
+  Order,
   Payment,
   PeriodClosure,
   PeriodReport,
   PixKeyType,
   PriceHistoryEntry,
+  ProductionRow,
   Product,
+  ReservationOffer,
   Sale,
   StockMovement,
   StoreSettings,
@@ -62,6 +65,16 @@ async function request<T>(url: string, options?: RequestInit): Promise<T> {
 }
 
 export const api = {
+  getOffers: () => request<ReservationOffer[]>('/api/offers'),
+  createOffer: (payload: { product_id: number; service_date?: string | null; limit_qty?: number | null; closes_at?: string | null }) =>
+    request<ReservationOffer>('/api/offers', { method: 'POST', body: JSON.stringify(payload) }),
+  updateOffer: (id: number, payload: Partial<{ status: 'open' | 'closed'; limit_qty: number | null; service_date: string | null; closes_at: string | null }>) =>
+    request<ReservationOffer>(`/api/offers/${id}`, { method: 'PUT', body: JSON.stringify(payload) }),
+  deleteOffer: (id: number) => request<{ deleted: boolean }>(`/api/offers/${id}`, { method: 'DELETE' }),
+  getOrders: () => request<Order[]>('/api/orders'),
+  orderAction: (id: number, action: 'approve' | 'reject' | 'deliver' | 'confirm-payment', payload: { confirm_payment?: boolean } = {}) =>
+    request<Order>(`/api/orders/${id}/${action}`, { method: 'POST', body: JSON.stringify(payload) }),
+  getProductionSheet: (date?: string) => request<ProductionRow[]>(date ? `/api/production-sheet?date=${encodeURIComponent(date)}` : '/api/production-sheet'),
   getBootstrap: (since: number | null) => request<BootstrapResponse>(since === null ? '/api/bootstrap' : `/api/bootstrap?since=${since}`),
   getStoreInfo: () => request<StoreInfo>('/api/store-info'),
   getCustomers: () => request<Employee[]>('/api/customers'),
