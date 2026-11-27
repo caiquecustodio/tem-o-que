@@ -1,4 +1,4 @@
-import { lazy, Suspense, useCallback, useEffect, useRef, useState } from 'react';
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { CSSProperties } from 'react';
 import {
   BarChart3,
@@ -20,6 +20,9 @@ import { AnimatePresence, motion } from 'motion/react';
 import { ApiError, api, apiUrl, getStoreSlugFromPath } from './api/client';
 import type { BootstrapData } from './api/client';
 import { localCache } from './api/localCache';
+import { outbox, useOutbox } from './api/outbox';
+import { applyOptimistic } from './api/optimistic';
+import { SyncStatusBar } from './components/SyncStatusBar';
 import type { DashboardSummary, Employee, LoyaltySettings, Product, Sale, StoreSettings, StoreType } from './types';
 import { DEFAULT_BILLING_TEMPLATE } from './utils/pix';
 const lazyView = <K extends string>(load: () => Promise<Record<K, React.ComponentType<any>>>, name: K) => lazy(() => load().then((module) => ({ default: module[name] })));
@@ -130,10 +133,10 @@ export default function App() {
   const [activeTab, setActiveTab] = useState<AdminTab>('dashboard');
   const [moreSheetOpen, setMoreSheetOpen] = useState(false);
 
-  const [summary, setSummary] = useState<DashboardSummary | null>(null);
-  const [products, setProducts] = useState<Product[]>([]);
-  const [employees, setEmployees] = useState<Employee[]>([]);
-  const [sales, setSales] = useState<Sale[]>([]);
+  const [baseSummary, setSummary] = useState<DashboardSummary | null>(null);
+  const [baseProducts, setProducts] = useState<Product[]>([]);
+  const [baseEmployees, setEmployees] = useState<Employee[]>([]);
+  const [baseSales, setSales] = useState<Sale[]>([]);
   const [storeSettings, setStoreSettings] = useState<StoreSettings>(DEFAULT_SETTINGS);
   const [storeType, setStoreType] = useState<StoreType>('complete');
   const [loyaltySettings, setLoyaltySettings] = useState<LoyaltySettings | null>(null);
@@ -148,6 +151,13 @@ export default function App() {
   const [focusedAccountId, setFocusedAccountId] = useState<number | null>(null);
   const [quickPayEmployeeId, setQuickPayEmployeeId] = useState<number | null>(null);
   const [restockProductId, setRestockProductId] = useState<number | null>(null);
+
+  // Dados do servidor + operações ainda na fila de sincronização = o que o usuário enxerga.
+  const { ops: pendingOps } = useOutbox();
+  const { summary, products, employees, sales } = useMemo(
+    () => applyOptimistic({ summary: baseSummary, products: baseProducts, employees: baseEmployees, sales: baseSales }, pendingOps),
+    [baseSummary, baseProducts, baseEmployees, baseSales, pendingOps],
+  );
 
   const cacheKey = `bootstrap:${getStoreSlugFromPath()}`;
   const dataVersionRef = useRef<number | null>(null);
@@ -164,7 +174,7 @@ export default function App() {
     hasDataRef.current = true;
   }, []);
 
-  const refreshAll = useCallback(async () => {
+  const refreshAll = useCallback(async (): Promise<boolean> => {
     setLoadError(null);
     try {
       const data = await api.getBootstrap(dataVersionRef.current);
@@ -174,15 +184,17 @@ export default function App() {
         applyBootstrap(data);
         void localCache.set(cacheKey, data);
       }
+      return true;
     } catch (err) {
       if (err instanceof ApiError && err.status === 401) {
         hasDataRef.current = false;
         dataVersionRef.current = null;
-        void localCache.clear();
+        void localCache.remove(cacheKey);
         setAuthenticated(false);
       } else if (!hasDataRef.current) {
         setLoadError((err as Error).message || 'Falha ao conectar com o servidor.');
       }
+      return false;
     } finally {
       setLoading(false);
     }
@@ -201,19 +213,26 @@ export default function App() {
       setLoading(false);
     });
     fetch(apiUrl('/api/auth/status')).then((res) => res.json() as Promise<{ authenticated?: boolean }>).then((data) => {
-      if (!data.authenticated) { confirmedLoggedOut = true; hasDataRef.current = false; dataVersionRef.current = null; void localCache.clear(); }
+      if (!data.authenticated) { confirmedLoggedOut = true; hasDataRef.current = false; dataVersionRef.current = null; void localCache.remove(cacheKey); }
       setAuthenticated(Boolean(data.authenticated));
     }).catch(() => { if (!hasDataRef.current) setAuthenticated(false); }).finally(() => setAuthReady(true));
+    void outbox.init(getStoreSlugFromPath());
     return () => { cancelled = true; };
   }, [applyBootstrap, cacheKey]);
 
   useEffect(() => {
     if (!authenticated) return;
     void refreshAll();
+    // Quando o servidor confirma operações da fila, recarrega e só então tira da fila (evita piscar valores).
+    outbox.setSentHandler(() => {
+      const reloadStartedAt = Date.now();
+      void refreshAll().then((reloaded) => { if (reloaded) outbox.purgeSent(reloadStartedAt); });
+    });
+    outbox.retryNow();
     const revalidate = () => { if (document.visibilityState === 'visible') void refreshAll(); };
     const timer = window.setInterval(revalidate, 60_000);
     document.addEventListener('visibilitychange', revalidate);
-    return () => { window.clearInterval(timer); document.removeEventListener('visibilitychange', revalidate); };
+    return () => { window.clearInterval(timer); document.removeEventListener('visibilitychange', revalidate); outbox.setSentHandler(null); };
   }, [refreshAll, authenticated]);
 
   const handleNavigateFromDashboard = (tab: 'pos' | 'accounts' | 'inventory' | 'reports', employeeId?: number) => {
@@ -346,7 +365,7 @@ export default function App() {
 
           <div className="flex items-center gap-2.5 shrink-0">
             <button
-              onClick={async () => { const response = await fetch(apiUrl('/api/auth/logout'), { method: 'POST' }); const data = await response.json() as { authenticated?: boolean }; if (!data.authenticated) { hasDataRef.current = false; dataVersionRef.current = null; await localCache.clear(); } setAuthenticated(Boolean(data.authenticated)); }}
+              onClick={async () => { const response = await fetch(apiUrl('/api/auth/logout'), { method: 'POST' }); const data = await response.json() as { authenticated?: boolean }; if (!data.authenticated) { hasDataRef.current = false; dataVersionRef.current = null; await localCache.remove(cacheKey); } setAuthenticated(Boolean(data.authenticated)); }}
               className="min-h-[38px] px-2.5 sm:px-3 rounded-xl text-xs font-medium text-slate-600 hover:bg-slate-100 inline-flex items-center gap-1.5 cursor-pointer"
               aria-label="Sair da conta"
             >
@@ -366,6 +385,7 @@ export default function App() {
 
         {/* Viewport Body */}
         <main className="flex-1 p-3.5 sm:p-6 lg:p-8 pb-28 lg:pb-8 max-w-[1400px] w-full mx-auto">
+          <SyncStatusBar />
           {loadError ? (
             <div className="bg-white border border-red-200 rounded-2xl p-8 text-center space-y-3">
               <p className="text-sm font-medium text-red-700">{loadError}</p>

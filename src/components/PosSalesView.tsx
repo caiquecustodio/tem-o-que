@@ -15,7 +15,8 @@ import {
 } from 'lucide-react';
 import type { Employee, LoyaltyProgress, LoyaltySettings, Product, Sale, StoreSettings, StoreType } from '../types';
 import { api } from '../api/client';
-import { CATEGORY_OPTIONS, formatBRL, formatDateTime } from '../utils/format';
+import { outbox } from '../api/outbox';
+import { CATEGORY_OPTIONS, formatBRL, formatDateTime, saleRef } from '../utils/format';
 import { ProductImage } from './ProductImage';
 import { LoyaltyCardPanel } from './LoyaltyCardPanel';
 
@@ -141,32 +142,35 @@ export function PosSalesView({ products, employees, sales, loyaltySettings, stor
       return;
     }
 
-    setSubmitting(true);
     setFeedback(null);
     setLoyaltyAfterSale(null);
-    try {
-      const created = await api.createSale({
-        employee_id: selectedEmployee.id,
-        items: cartList.map((c) => ({ product_id: c.product.id, quantity: c.quantity })),
-        notes,
-        created_by: 'Administrador',
-        ...(storeType === 'lite' ? { payment_status: paymentStatus } : {}),
+    const items = cartList.map((c) => ({ product_id: c.product.id, quantity: c.quantity }));
+    const totalCents = cartList.reduce((sum, c) => sum + c.product.price_cents * c.quantity, 0);
+    const salePaymentStatus = storeType === 'lite' ? paymentStatus : undefined;
+    // A venda aparece na hora; o envio ao servidor segue na fila, com reenvio seguro (idempotente).
+    const queued = outbox.enqueue({
+      kind: 'sale.create',
+      label: `Venda para ${selectedEmployee.name}`,
+      path: '/api/sales',
+      body: { employee_id: selectedEmployee.id, items, notes, created_by: 'Administrador', ...(salePaymentStatus ? { payment_status: salePaymentStatus } : {}) },
+      meta: {
+        employee_id: selectedEmployee.id, employee_name: selectedEmployee.name, total_cents: totalCents, notes, payment_status: salePaymentStatus,
+        items: cartList.map((c) => ({ product_id: c.product.id, product_name: c.product.name, quantity: c.quantity, unit_price_cents: c.product.price_cents })),
+      },
+    });
+    const employeeId = selectedEmployee.id;
+    setCart({});
+    setNotes('');
+    setMobileBagOpen(false);
+    setFeedback({
+      type: 'success',
+      message: `Venda registrada para ${selectedEmployee.name} (${formatBRL(totalCents)})${storeType === 'lite' ? paymentStatus === 'paid' ? ' · paga' : ' · pendente' : ''}. Sincronizando em segundo plano.`,
+    });
+    if (loyaltySettings?.enabled) {
+      void queued.result.then(async (created) => {
+        if (!created) return;
+        try { setLoyaltyAfterSale(await api.getLoyaltyProgress(employeeId)); } catch { setLoyaltyAfterSale(null); }
       });
-      setCart({});
-      setNotes('');
-      setMobileBagOpen(false);
-      await onDataChanged();
-      if (loyaltySettings?.enabled) {
-        try { setLoyaltyAfterSale(await api.getLoyaltyProgress(selectedEmployee.id)); } catch { setLoyaltyAfterSale(null); }
-      }
-      setFeedback({
-        type: 'success',
-        message: `Venda #${created.id} registrada para ${created.employee_name} (${formatBRL(created.total_cents)})${storeType === 'lite' ? paymentStatus === 'paid' ? ' · paga' : ' · pendente' : ''}.`,
-      });
-    } catch (err) {
-      setFeedback({ type: 'error', message: (err as Error).message });
-    } finally {
-      setSubmitting(false);
     }
   };
 
@@ -821,7 +825,7 @@ export function PosSalesView({ products, employees, sales, loyaltySettings, stor
                     <div>
                       <p className="text-sm font-semibold text-slate-900">{sale.employee_name}</p>
                       <p className="text-xs text-slate-500 font-mono tabular-nums">
-                        #{sale.id} · {formatDateTime(sale.created_at)}
+                        {saleRef(sale.id)} · {formatDateTime(sale.created_at)}
                       </p>
                     </div>
                     <div className="text-right">
@@ -842,7 +846,7 @@ export function PosSalesView({ products, employees, sales, loyaltySettings, stor
                   <p className="text-xs text-slate-600">
                     {sale.items.map((it) => `${it.quantity}× ${it.product_name}`).join(', ')}
                   </p>
-                  {sale.status === 'active' && (
+                  {sale.status === 'active' && sale.id > 0 && (
                     <div className="flex items-center gap-2 pt-1">
                       <button
                         onClick={() => openCorrectModal(sale)}
@@ -892,7 +896,7 @@ export function PosSalesView({ products, employees, sales, loyaltySettings, stor
                   filteredSales.map((sale) => (
                     <tr key={sale.id} className="hover:bg-slate-50/70">
                       <td className="py-3 px-4 font-mono tabular-nums text-xs text-slate-600">
-                        #{sale.id}
+                        {saleRef(sale.id)}
                         {sale.corrected_from_sale_id && (
                           <span className="block text-[11px] text-slate-400">Corrige #{sale.corrected_from_sale_id}</span>
                         )}
@@ -921,7 +925,7 @@ export function PosSalesView({ products, employees, sales, loyaltySettings, stor
                         {formatBRL(sale.total_cents)}
                       </td>
                       <td className="py-3 px-4 text-right whitespace-nowrap">
-                        {sale.status === 'active' ? (
+                        {sale.status === 'active' && sale.id > 0 ? (
                           <div className="inline-flex items-center gap-2">
                             <button
                               onClick={() => openCorrectModal(sale)}

@@ -1,7 +1,9 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { ArrowLeft, CreditCard, Printer, QrCode, Search, UserPlus, X } from 'lucide-react';
 import type { Employee, EmployeeStatement, LoyaltyProgress, LoyaltySettings, StoreSettings } from '../types';
 import { api } from '../api/client';
+import { outbox, useOutbox } from '../api/outbox';
+import type { OutboxOp } from '../api/outbox';
 import { formatBRL, formatDateTime, parseBRLToCents } from '../utils/format';
 import { PixBillingModal } from './PixBillingModal';
 import { LoyaltyCardPanel } from './LoyaltyCardPanel';
@@ -15,6 +17,23 @@ interface AccountsViewProps {
   onClearQuickPay?: () => void;
   onOpenSettings: () => void;
   onDataChanged: () => Promise<void>;
+}
+
+/** Soma ao extrato os pagamentos ainda na fila (o servidor ainda não os conhece). */
+function withQueuedPayments(data: EmployeeStatement, ops: OutboxOp[]): EmployeeStatement {
+  const queued = ops.filter((op) => op.kind === 'payment.create' && op.state === 'queued' && op.meta.employee_id === data.employee.id);
+  if (!queued.length) return data;
+  let employee = data.employee;
+  const entries = queued.map((op) => {
+    const amount = Number(op.meta.amount_cents);
+    const stamp = new Date(op.createdAt).toISOString();
+    employee = { ...employee, total_paid_cents: employee.total_paid_cents + amount, balance_cents: employee.balance_cents - amount, last_activity_at: stamp };
+    return {
+      uid: `pending-${op.id}`, kind: 'payment' as const, created_at: stamp, title: `Pagamento (${op.meta.method}), sincronizando`, amount_cents: amount, running_balance_cents: employee.balance_cents,
+      payment: { id: -op.createdAt, employee_id: employee.id, amount_cents: amount, method: String(op.meta.method), received_by: 'Administrador', notes: String(op.meta.notes ?? ''), balance_after_cents: employee.balance_cents, created_at: stamp },
+    };
+  });
+  return { employee, ledger: [...entries.reverse(), ...data.ledger] };
 }
 
 export function AccountsView({
@@ -63,11 +82,15 @@ export function AccountsView({
     }
   }, [employees, selectedId]);
 
+  const { ops: outboxOps, syncTick } = useOutbox();
+  const outboxOpsRef = useRef<OutboxOp[]>(outboxOps);
+  outboxOpsRef.current = outboxOps;
+
   const loadStatement = async (id: number) => {
     setLoadingStatement(true);
     try {
       const data = await api.getEmployeeStatement(id);
-      setStatement(data);
+      setStatement(withQueuedPayments(data, outboxOpsRef.current));
     } catch {
       setStatement(null);
     } finally {
@@ -79,7 +102,7 @@ export function AccountsView({
     if (selectedId) {
       loadStatement(selectedId);
     }
-  }, [selectedId, employees]);
+  }, [selectedId, employees, syncTick]);
 
   useEffect(() => {
     if (!selectedId || !loyaltySettings?.enabled) {
@@ -141,16 +164,15 @@ export function AccountsView({
     setSubmitting(true);
     setPayError(null);
     try {
-      await api.createPayment({
-        employee_id: statement.employee.id,
-        amount_cents: cents,
-        method: payMethod,
-        received_by: 'Administrador',
-        notes: payNotes.trim(),
+      // O pagamento aparece na hora; o envio ao servidor segue na fila, com reenvio seguro (idempotente).
+      outbox.enqueue({
+        kind: 'payment.create',
+        label: `Pagamento de ${statement.employee.name}`,
+        path: '/api/payments',
+        body: { employee_id: statement.employee.id, amount_cents: cents, method: payMethod, received_by: 'Administrador', notes: payNotes.trim() },
+        meta: { employee_id: statement.employee.id, amount_cents: cents, method: payMethod, notes: payNotes.trim() },
       });
       setShowPayModal(false);
-      await onDataChanged();
-      await loadStatement(statement.employee.id);
     } catch (err) {
       setPayError((err as Error).message);
     } finally {

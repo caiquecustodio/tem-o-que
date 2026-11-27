@@ -49,3 +49,7 @@ export const CATEGORY_IMAGES: Record<string, string> = {
   'Lanches & Bebidas': svgData(`<rect width="160" height="160" rx="28" fill="#eff6ff"/><path d="M42 43h34l4 82H38z" fill="#fff" stroke="#2563eb" stroke-width="5" stroke-linejoin="round"/><path d="M48 43V31h22v12" fill="#bfdbfe" stroke="#2563eb" stroke-width="5" stroke-linejoin="round"/><path d="M44 82h32l2 39H42z" fill="#93c5fd"/><path d="M88 65h42l-7 15H93z" fill="#fbbf24" stroke="#b45309" stroke-width="4"/><path d="M94 80h32l-5 29H99z" fill="#fef3c7" stroke="#b45309" stroke-width="4"/><path d="M91 92h35" stroke="#16a34a" stroke-width="6"/><path d="m91 82 8-8m17 8 8-8" stroke="#b45309" stroke-width="3"/>`),
   Outros: svgData(`<rect width="160" height="160" rx="28" fill="#f1f5f9"/><path d="M47 47h66v75H47z" fill="#fff" stroke="#475569" stroke-width="5"/><path d="M57 66h46M57 81h46M57 96h30" stroke="#94a3b8" stroke-width="5" stroke-linecap="round"/>`),
 };
+
+/** Venda ainda não confirmada pelo servidor tem id negativo temporário. */
+export const isSyncedId = (id: number) => id > 0;
+export const saleRef = (id: number) => (id > 0 ? `#${id}` : 'Sincronizando');

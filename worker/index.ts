@@ -347,13 +347,36 @@ async function handlePlatformApi(req: Request, env: Env): Promise<Response> {
   return err('Rota administrativa não encontrada.',404);
 }
 
+const IDEMPOTENCY_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+const IDEMPOTENCY_KEY_PATTERN = /^[A-Za-z0-9_-]{8,64}$/;
+
+async function findIdempotentReplay(rootDb: D1Database, storeId: number, key: string): Promise<Response | null> {
+  try {
+    const row = await first<{ status: number; body: string }>(rootDb, 'SELECT status,body FROM idempotency_keys WHERE store_id=? AND key=?', storeId, key);
+    return row ? new Response(row.body, { status: row.status, headers: { 'Content-Type': 'application/json', 'Cache-Control': 'private, no-store', 'X-Idempotent-Replay': 'true' } }) : null;
+  } catch { return null; }
+}
+async function saveIdempotentResult(rootDb: D1Database, storeId: number, key: string, response: Response) {
+  try {
+    await run(rootDb, 'INSERT OR IGNORE INTO idempotency_keys(store_id,key,status,body,created_at) VALUES(?,?,?,?,?)', storeId, key, response.status, await response.clone().text(), Date.now());
+    if (Math.random() < 0.02) await run(rootDb, 'DELETE FROM idempotency_keys WHERE created_at<?', Date.now() - IDEMPOTENCY_TTL_MS);
+  } catch {}
+}
+
 async function handleApi(req: Request, env: Env, store: ManagedStore, rootDb: D1Database): Promise<Response> {
-  const response = await routeApi(req, env, store, rootDb);
-  if (req.method !== 'GET' && response.ok && !new URL(req.url).pathname.startsWith('/api/auth/')) await bumpDataVersion(rootDb, store.id);
+  const rawKey = req.method === 'POST' ? req.headers.get('Idempotency-Key') : null;
+  const idempotencyKey = rawKey && IDEMPOTENCY_KEY_PATTERN.test(rawKey) ? rawKey : null;
+  // A reexecução só é consultada depois da autenticação (dentro de routeApi), para não vazar respostas.
+  const response = await routeApi(req, env, store, rootDb, idempotencyKey);
+  const isMutation = req.method !== 'GET' && response.ok && !new URL(req.url).pathname.startsWith('/api/auth/');
+  if (isMutation && response.headers.get('X-Idempotent-Replay') !== 'true') {
+    await bumpDataVersion(rootDb, store.id);
+    if (idempotencyKey) await saveIdempotentResult(rootDb, store.id, idempotencyKey, response);
+  }
   return response;
 }
 
-async function routeApi(req: Request, env: Env, store: ManagedStore, rootDb: D1Database): Promise<Response> {
+async function routeApi(req: Request, env: Env, store: ManagedStore, rootDb: D1Database, idempotencyKey: string | null = null): Promise<Response> {
   await ensureStoreSchema(rootDb, store);
   const storeEnv = { ...env, DB: scopedDatabase(rootDb,store.id) } as Env;
   const db = storeEnv.DB, url = new URL(req.url), path = url.pathname, method = req.method;
@@ -364,6 +387,7 @@ async function routeApi(req: Request, env: Env, store: ManagedStore, rootDb: D1D
     if (path === '/api/auth/login' && method === 'POST') return login(req, storeEnv,store.username,store.slug);
     if (path === '/api/auth/logout' && method === 'POST') return new Response(JSON.stringify({ authenticated: false }), { headers: { 'Content-Type': 'application/json', 'Set-Cookie': `${sessionCookieName(store.slug)}=; Path=${sessionCookiePath(store.slug)}; HttpOnly; Secure; SameSite=Strict; Max-Age=0` } });
     if (!await isAuthenticated(req, storeEnv, store.slug)) return err('Faça login para acessar os dados da loja.', 401);
+    if (idempotencyKey) { const replay = await findIdempotentReplay(rootDb, store.id, idempotencyKey); if (replay) return replay; }
     if (path === '/api/auth/password' && method === 'POST') return changePassword(req, storeEnv,store.slug);
     if (path === '/api/bootstrap' && method === 'GET') return json(await bootstrap(rootDb, db, store.id, url.searchParams.get('since')));
     if (path === '/api/settings' && method === 'GET') return json(await first(db, 'SELECT * FROM store_settings WHERE id=1'));

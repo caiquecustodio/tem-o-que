@@ -1,6 +1,6 @@
 import { AlertTriangle, ArrowUpRight, CreditCard, PackagePlus, Plus, ShoppingBag, TrendingUp, Users } from 'lucide-react';
 import type { DashboardSummary, Employee } from '../types';
-import { formatBRL, formatDateTime } from '../utils/format';
+import { formatBRL, formatDateTime, saleRef } from '../utils/format';
 
 interface DashboardViewProps {
   summary: DashboardSummary | null;
@@ -206,7 +206,7 @@ export function DashboardView({
                     <div className="min-w-0">
                       <p className="text-sm font-medium text-slate-900 truncate">{sale.employee_name}</p>
                       <p className="text-xs text-slate-500 truncate">
-                        #{sale.id}
+                        {saleRef(sale.id)}
                         <span className="mx-1.5" aria-hidden="true">·</span>
                         {sale.items.map((it) => `${it.quantity}× ${it.product_name}`).join(', ')}
                       </p>
