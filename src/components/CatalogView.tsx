@@ -2,7 +2,8 @@ import { useEffect, useMemo, useState } from 'react';
 import { Edit2, History, Plus, Search, X } from 'lucide-react';
 import type { PriceHistoryEntry, Product } from '../types';
 import { api } from '../api/client';
-import { CATEGORY_IMAGES, CATEGORY_OPTIONS, formatBRL, formatDateTime, parseBRLToCents } from '../utils/format';
+import { CATEGORY_IMAGES, CATEGORY_OPTIONS, formatBRL, formatDateTime, parseBRLToCents, centsToInput, parseOptionalBRLToCents } from '../utils/format';
+import { CostField } from './CostField';
 import { ProductImage } from './ProductImage';
 
 interface CatalogViewProps {
@@ -26,6 +27,7 @@ export function CatalogView({ products, onDataChanged }: CatalogViewProps) {
   const [formCategory, setFormCategory] = useState<string>('Sucos');
   const [formImage, setFormImage] = useState('');
   const [formPriceStr, setFormPriceStr] = useState('5,00');
+  const [formCostStr, setFormCostStr] = useState('');
   const [formStock, setFormStock] = useState(10);
   const [formMinStock, setFormMinStock] = useState(5);
   const [formAvailable, setFormAvailable] = useState(true);
@@ -56,6 +58,7 @@ export function CatalogView({ products, onDataChanged }: CatalogViewProps) {
     setFormCategory('Sucos');
     setFormImage(CATEGORY_IMAGES['Sucos']);
     setFormPriceStr('7,00');
+    setFormCostStr('');
     setFormStock(12);
     setFormMinStock(5);
     setFormAvailable(true);
@@ -71,6 +74,7 @@ export function CatalogView({ products, onDataChanged }: CatalogViewProps) {
     setFormCategory(prod.category);
     setFormImage(CATEGORY_IMAGES[prod.category] || CATEGORY_IMAGES.Outros);
     setFormPriceStr((prod.price_cents / 100).toFixed(2).replace('.', ','));
+    setFormCostStr(centsToInput(prod.cost_cents));
     setFormStock(prod.stock);
     setFormMinStock(prod.min_stock);
     setFormAvailable(Boolean(prod.available));
@@ -105,6 +109,7 @@ export function CatalogView({ products, onDataChanged }: CatalogViewProps) {
           category: formCategory,
           image_url: CATEGORY_IMAGES[formCategory] || CATEGORY_IMAGES.Outros,
           price_cents: priceCents,
+          cost_cents: parseOptionalBRLToCents(formCostStr),
           stock: formStock,
           min_stock: formMinStock,
           available: formAvailable ? 1 : 0,
@@ -116,6 +121,7 @@ export function CatalogView({ products, onDataChanged }: CatalogViewProps) {
           category: formCategory,
           image_url: CATEGORY_IMAGES[formCategory] || CATEGORY_IMAGES.Outros,
           price_cents: priceCents,
+          cost_cents: parseOptionalBRLToCents(formCostStr),
           min_stock: formMinStock,
           available: formAvailable ? 1 : 0,
           price_reason: formPriceReason.trim() || 'Atualização de tabela de preços',
@@ -408,6 +414,7 @@ export function CatalogView({ products, onDataChanged }: CatalogViewProps) {
                   />
                 </div>
               </div>
+              <CostField value={formCostStr} onChange={setFormCostStr} priceCents={parseBRLToCents(formPriceStr)} hint="Usado só no relatório de lucro. Vendas antigas não mudam." />
 
               {editingProduct && parseBRLToCents(formPriceStr) !== editingProduct.price_cents && (
                 <div>

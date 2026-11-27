@@ -7,7 +7,7 @@ Testar local, commit, push direto na `main`. Deploy: `npm run cf:deploy` (aplica
 
 ## Mapa
 - `worker/index.ts`: roteamento, auth por cookie assinado, API por loja (`/s/<slug>/api/*`), `/api/bootstrap`, idempotência e índices.
-- `migrations/`: esquema D1. 0008 índices, 0009 `store_data_version`, 0010 `idempotency_keys`, 0011 reservas (`reservation_offers`, `orders`, `order_items`, `public_rate_limits`, `store_settings.whatsapp_phone`). **Aplicar a migration antes do deploy do Worker.**
+- `migrations/`: esquema D1. 0008 índices, 0009 `store_data_version`, 0010 `idempotency_keys`, 0011 reservas (`reservation_offers`, `orders`, `order_items`, `public_rate_limits`, `store_settings.whatsapp_phone`). 0012 custo (`products.cost_cents`, `sale_items.unit_cost_cents`). **Aplicar a migration antes do deploy do Worker.**
 - `src/App.tsx`: casca, abas (views carregadas com `lazy`), estado do servidor + fila otimista.
 - `src/api/client.ts`: chamadas HTTP e `ApiError`.
 - `src/api/localCache.ts`: IndexedDB com o último estado da loja (abre instantâneo, funciona sem rede).
@@ -30,3 +30,9 @@ Testar local, commit, push direto na `main`. Deploy: `npm run cf:deploy` (aplica
 - Proteção da página pública: erro único na identificação (sem revelar se o nome existe), limite por IP e global (`public_rate_limits`, falha fechado) e Turnstile **opcional**: só exige se `TURNSTILE_SECRET` existir (e `TURNSTILE_SITE_KEY` exibe o widget). Configurar os dois antes de divulgar o link.
 - Tabelas novas entram em `STORE_TABLES`; lojas existentes ganham as tabelas em `ensureReservationSchema` na primeira requisição.
 - Dev local: `wrangler dev` em porta nova após cada `vite build` (o dev server não enxerga assets reconstruídos).
+
+## Custo e lucro
+- Custo de compra é **opcional** (`products.cost_cents`, null = não informado). Editável no Estoque (tela simples, que vale para todas as lojas) e no Catálogo. PUT sem `cost_cents` mantém; `null` ou vazio limpa. Entrada de estoque aceita `unit_cost_cents` e atualiza o custo atual.
+- Cada venda congela o custo em `sale_items.unit_cost_cents`; mudar o custo depois não reescreve o lucro do passado.
+- `GET /api/profit-report?startDate&endDate[&useCurrentCost=1]`: lucro só sobre itens com custo; o restante aparece como "sem custo". `useCurrentCost` estima vendas antigas usando o custo atual. UI: `ProfitReportView` (aba Lucro; na loja Lite fica abaixo do relatório rápido).
+- Lojas antigas ganham as colunas em `ensureCostSchema` na primeira requisição.

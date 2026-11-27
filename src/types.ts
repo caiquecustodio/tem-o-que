@@ -53,6 +53,7 @@ export interface Product {
   category: string;
   image_url: string;
   price_cents: number;
+  cost_cents?: number | null;
   stock: number;
   min_stock: number;
   available: number;
@@ -263,4 +264,30 @@ export interface ProductionRow {
   quantity: number;
   pending_quantity: number;
   orders_count: number;
+}
+
+export interface ProfitRow {
+  product_id?: number;
+  product_name?: string;
+  day?: string;
+  units: number;
+  revenue_cents: number;
+  revenue_with_cost_cents: number;
+  cost_cents: number;
+  profit_cents: number;
+  lines_without_cost: number;
+}
+
+export interface ProfitReport {
+  start_date: string;
+  end_date: string;
+  use_current_cost: boolean;
+  revenue_cents: number;
+  revenue_with_cost_cents: number;
+  revenue_without_cost_cents: number;
+  cost_cents: number;
+  profit_cents: number;
+  products_without_cost: number;
+  by_product: ProfitRow[];
+  by_day: ProfitRow[];
 }

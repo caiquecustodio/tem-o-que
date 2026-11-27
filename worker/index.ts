@@ -43,6 +43,23 @@ function storeIndexStatements(db: D1Database, suffix: string) {
   ];
   return defs.map(([name, table, cols]) => db.prepare(`CREATE INDEX IF NOT EXISTS idx_${name}${suffix} ON ${table}${suffix}(${cols})`));
 }
+/** Custo opcional em centavos: undefined = não informado, null = sem custo, false = inválido. */
+function parseCost(value: unknown): number | null | undefined | false {
+  if (value === undefined) return undefined;
+  if (value === null || value === '') return null;
+  const cents = Math.round(Number(value));
+  return Number.isFinite(cents) && cents >= 0 && cents <= 100_000_000 ? cents : false;
+}
+async function ensureCostSchema(rootDb: D1Database, storeId: number) {
+  const columns: Array<[string, string, string]> = [
+    [`products__${storeId}`, 'cost_cents', 'INTEGER CHECK (cost_cents IS NULL OR cost_cents >= 0)'],
+    [`sale_items__${storeId}`, 'unit_cost_cents', 'INTEGER CHECK (unit_cost_cents IS NULL OR unit_cost_cents >= 0)'],
+  ];
+  for (const [table, column, definition] of columns) {
+    const schema = await first<{sql:string|null}>(rootDb,"SELECT sql FROM sqlite_master WHERE type='table' AND name=?",table);
+    if (schema?.sql && !schema.sql.includes(column)) await rootDb.prepare(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`).run();
+  }
+}
 async function cloneStoreTable(db: D1Database, table: string, storeId: number) {
   const schema = await first<{sql:string|null}>(db,"SELECT sql FROM sqlite_master WHERE type='table' AND name=?",table);
   if (!schema?.sql) throw new Error(`Não foi possível preparar a tabela ${table}.`);
@@ -75,6 +92,7 @@ async function ensureStoreSchema(rootDb: D1Database, store: ManagedStore) {
     try { await rootDb.prepare(`ALTER TABLE ${table} ADD COLUMN paid_at TEXT`).run(); } catch {}
   }
   await rootDb.batch(storeIndexStatements(rootDb, `__${store.id}`));
+  try { await ensureCostSchema(rootDb, store.id); } catch (error) { console.error('Custo de produtos indisponível nesta loja até a migration 0012 ser aplicada.', error); return; }
   try { await ensureReservationSchema(rootDb, store.id); } catch (error) { console.error('Reservas indisponíveis nesta loja até a migration 0011 ser aplicada.', error); return; }
   schemaReadyStores.add(store.id);
 }
@@ -274,7 +292,7 @@ async function createSale(db: D1Database, input: { employee_id: number; items: A
   }
   const lines: Array<{ id: number; product: Row; qty: number; subtotal: number; before: number }> = [];
   for (const [pid, qty] of merged) {
-    const product = await first<Row>(db, 'SELECT id,name,price_cents,stock,available FROM products WHERE id=?', pid);
+    const product = await first<Row>(db, 'SELECT id,name,price_cents,cost_cents,stock,available FROM products WHERE id=?', pid);
     if (!product) throw new Error(`Produto #${pid} não encontrado.`);
     if (!product.available) throw new Error(`O produto "${product.name}" está indisponível para venda.`);
     const before = Number(product.stock) + (input.stockCredits?.get(pid) ?? 0);
@@ -287,8 +305,8 @@ async function createSale(db: D1Database, input: { employee_id: number; items: A
     VALUES(?,?,?,'active',?,?,?,?,?,?)`).bind(saleId, input.employee_id, total, input.notes?.trim() ?? '', input.corrected_from_sale_id ?? null, actor, stamp, input.payment_status ?? 'untracked', input.payment_status === 'paid' ? stamp : null)];
   for (const line of lines) {
     const after = line.before - line.qty;
-    statements.push(db.prepare(`INSERT INTO sale_items(sale_id,product_id,product_name,quantity,unit_price_cents,subtotal_cents) VALUES(?,?,?,?,?,?)`)
-      .bind(saleId, line.id, line.product.name, line.qty, line.product.price_cents, line.subtotal));
+    statements.push(db.prepare(`INSERT INTO sale_items(sale_id,product_id,product_name,quantity,unit_price_cents,subtotal_cents,unit_cost_cents) VALUES(?,?,?,?,?,?,?)`)
+      .bind(saleId, line.id, line.product.name, line.qty, line.product.price_cents, line.subtotal, line.product.cost_cents ?? null));
     statements.push(db.prepare(`UPDATE products SET stock=?,updated_at=? WHERE id=? AND stock>=?`).bind(after, stamp, line.id, line.qty));
     statements.push(db.prepare(`INSERT INTO stock_movements(product_id,type,quantity_delta,stock_before,stock_after,reason,reference_id,created_by,created_at)
       VALUES(?,'sale',?,?,?,?,?,?,?)`).bind(line.id, -line.qty, line.before, after, `Venda #${saleId} (${employee.name})`, saleId, actor, stamp));
@@ -473,8 +491,9 @@ async function routeApi(req: Request, env: Env, store: ManagedStore, rootDb: D1D
       if (!String(d.category ?? '').trim()) return err('Categoria é obrigatória.');
       const price = Math.round(Number(d.price_cents)), stock = Math.max(0, Math.round(Number(d.stock ?? 0)));
       if (!Number.isFinite(price) || price < 0) return err('Preço inválido.');
-      const stmts = [db.prepare(`INSERT INTO products(id,name,description,category,image_url,price_cents,stock,min_stock,available,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)`)
-        .bind(id, d.name.trim(), String(d.description ?? '').trim(), d.category.trim(), String(d.image_url ?? ''), price, stock, Math.max(0, Number(d.min_stock ?? 5)), d.available ? 1 : 0, stamp, stamp)];
+      const newCost = parseCost(d.cost_cents); if (newCost === false) return err('Custo de compra inválido.');
+      const stmts = [db.prepare(`INSERT INTO products(id,name,description,category,image_url,price_cents,cost_cents,stock,min_stock,available,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`)
+        .bind(id, d.name.trim(), String(d.description ?? '').trim(), d.category.trim(), String(d.image_url ?? ''), price, newCost ?? null, stock, Math.max(0, Number(d.min_stock ?? 5)), d.available ? 1 : 0, stamp, stamp)];
       if (stock) stmts.push(db.prepare(`INSERT INTO stock_movements(product_id,type,quantity_delta,stock_before,stock_after,reason,created_by,created_at) VALUES(?,'entry',?,0,?,'Cadastro inicial do produto',?,?)`).bind(id, stock, stock, d.created_by ?? 'Administrador', stamp));
       await batch(db, stmts); return json(await first(db, 'SELECT * FROM products WHERE id=?', id), 201);
     }
@@ -490,10 +509,11 @@ async function routeApi(req: Request, env: Env, store: ManagedStore, rootDb: D1D
       const id = Number(match[2]), old = await first<Row>(db, 'SELECT * FROM products WHERE id=?', id); if (!old) return err('Produto não encontrado.',404);
       const d = await body(req), price = Math.round(Number(d.price_cents ?? old.price_cents)), stamp = now();
       if (!Number.isFinite(price) || price < 0) return err('Preço inválido.');
+      const editedCost = parseCost(d.cost_cents); if (editedCost === false) return err('Custo de compra inválido.');
       const stmts: D1PreparedStatement[] = [];
       if (price !== Number(old.price_cents)) stmts.push(db.prepare(`INSERT INTO price_history(product_id,old_price_cents,new_price_cents,reason,changed_by,created_at) VALUES(?,?,?,?,?,?)`).bind(id, old.price_cents, price, d.price_reason ?? 'Alteração de tabela de preços', d.changed_by ?? 'Administrador', stamp));
-      stmts.push(db.prepare(`UPDATE products SET name=?,description=?,category=?,image_url=?,price_cents=?,min_stock=?,available=?,updated_at=? WHERE id=?`).bind(
-        String(d.name ?? old.name).trim(), String(d.description ?? old.description), String(d.category ?? old.category).trim(), String(d.image_url ?? old.image_url), price, Math.max(0, Number(d.min_stock ?? old.min_stock)), d.available === undefined ? old.available : (d.available ? 1 : 0), stamp, id));
+      stmts.push(db.prepare(`UPDATE products SET name=?,description=?,category=?,image_url=?,price_cents=?,cost_cents=?,min_stock=?,available=?,updated_at=? WHERE id=?`).bind(
+        String(d.name ?? old.name).trim(), String(d.description ?? old.description), String(d.category ?? old.category).trim(), String(d.image_url ?? old.image_url), price, editedCost === undefined ? (old.cost_cents ?? null) : editedCost, Math.max(0, Number(d.min_stock ?? old.min_stock)), d.available === undefined ? old.available : (d.available ? 1 : 0), stamp, id));
       await batch(db, stmts); return json(await first(db, 'SELECT * FROM products WHERE id=?', id));
     }
     if (path === '/api/price-history' && method === 'GET') {
@@ -508,7 +528,8 @@ async function routeApi(req: Request, env: Env, store: ManagedStore, rootDb: D1D
       else if (d.type === 'adjustment') { after = Math.round(Number(d.new_stock)); if (after < 0) return err('Novo estoque inválido.'); if (after === before) return err('A quantidade informada já é o estoque atual.'); }
       else return err('Tipo de movimentação inválido.');
       const stamp = now();
-      await batch(db,[db.prepare('UPDATE products SET stock=?,updated_at=? WHERE id=?').bind(after,stamp,id),db.prepare(`INSERT INTO stock_movements(product_id,type,quantity_delta,stock_before,stock_after,reason,created_by,created_at) VALUES(?,?,?,?,?,?,?,?)`).bind(id,d.type,after-before,before,after,String(d.reason).trim(),d.created_by ?? 'Administrador',stamp)]);
+      const purchaseCost = d.type === 'entry' ? parseCost(d.unit_cost_cents) : undefined; if (purchaseCost === false) return err('Custo de compra inválido.');
+      await batch(db,[db.prepare('UPDATE products SET stock=?,cost_cents=COALESCE(?,cost_cents),updated_at=? WHERE id=?').bind(after,purchaseCost ?? null,stamp,id),db.prepare(`INSERT INTO stock_movements(product_id,type,quantity_delta,stock_before,stock_after,reason,created_by,created_at) VALUES(?,?,?,?,?,?,?,?)`).bind(id,d.type,after-before,before,after,String(d.reason).trim(),d.created_by ?? 'Administrador',stamp)]);
       return json(await first(db,'SELECT * FROM products WHERE id=?',id));
     }
     if (path === '/api/stock-movements' && method === 'GET') return json(await all(db,`SELECT sm.*,p.name product_name,p.category product_category FROM stock_movements sm JOIN products p ON p.id=sm.product_id ORDER BY sm.created_at DESC,sm.id DESC LIMIT 200`));
@@ -565,6 +586,21 @@ async function routeApi(req: Request, env: Env, store: ManagedStore, rootDb: D1D
       const sr=await all(db,`${saleSelect} ORDER BY s.created_at DESC,s.id DESC LIMIT 6`),payments=await all(db,'SELECT p.*,e.name employee_name FROM payments p JOIN employees e ON e.id=p.employee_id ORDER BY p.created_at DESC,p.id DESC LIMIT 6');
       const pending=balances.reduce((sum,r)=>sum+Math.max(0,Number(r.balance)),0);
       return json({total_revenue_cents:Number(rev?.total??0),total_credit_sales_cents:Number(rev?.total??0),total_received_cents:Number(paid?.total??0),total_pending_cents:pending,debtors_count:balances.filter(r=>Number(r.balance)>0).length,low_stock_products:low,top_products:top,recent_sales:await saleRows(db,sr),recent_payments:payments});
+    }
+    if (path === '/api/profit-report' && method === 'GET') {
+      const today = new Date(), start = String(url.searchParams.get('startDate') ?? new Date(today.getFullYear(), today.getMonth(), 1).toISOString().slice(0, 10)), end = String(url.searchParams.get('endDate') ?? today.toISOString().slice(0, 10));
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(start) || !/^\d{4}-\d{2}-\d{2}$/.test(end)) return err('Período inválido.');
+      const from = `${start}T00:00:00.000Z`, to = `${end}T23:59:59.999Z`;
+      // "Custo atual" preenche só as vendas antigas sem custo registrado; nunca altera o que foi congelado na venda.
+      const cost = url.searchParams.get('useCurrentCost') === '1' ? 'COALESCE(si.unit_cost_cents,p.cost_cents)' : 'si.unit_cost_cents';
+      const metrics = `SUM(si.quantity) units,SUM(si.subtotal_cents) revenue_cents,SUM(CASE WHEN ${cost} IS NOT NULL THEN si.subtotal_cents ELSE 0 END) revenue_with_cost_cents,SUM(CASE WHEN ${cost} IS NOT NULL THEN ${cost}*si.quantity ELSE 0 END) cost_cents,SUM(CASE WHEN ${cost} IS NULL THEN 1 ELSE 0 END) lines_without_cost`;
+      const base = `FROM sale_items si JOIN sales s ON s.id=si.sale_id LEFT JOIN products p ON p.id=si.product_id WHERE s.status='active' AND s.created_at>=? AND s.created_at<=?`;
+      const byProduct = await all<Row>(db, `SELECT si.product_id,si.product_name,${metrics} ${base} GROUP BY si.product_id,si.product_name ORDER BY revenue_cents DESC`, from, to);
+      const byDay = await all<Row>(db, `SELECT substr(s.created_at,1,10) day,${metrics} ${base} GROUP BY substr(s.created_at,1,10) ORDER BY day`, from, to);
+      const sum = (rows: Row[], key: string) => rows.reduce((total, row) => total + Number(row[key] ?? 0), 0);
+      const withProfit = (row: Row) => ({ ...row, profit_cents: Number(row.revenue_with_cost_cents) - Number(row.cost_cents) });
+      const revenue = sum(byProduct, 'revenue_cents'), revenueWithCost = sum(byProduct, 'revenue_with_cost_cents'), totalCost = sum(byProduct, 'cost_cents');
+      return json({ start_date: start, end_date: end, use_current_cost: url.searchParams.get('useCurrentCost') === '1', revenue_cents: revenue, revenue_with_cost_cents: revenueWithCost, revenue_without_cost_cents: revenue - revenueWithCost, cost_cents: totalCost, profit_cents: revenueWithCost - totalCost, products_without_cost: byProduct.filter((row) => Number(row.lines_without_cost) > 0).length, by_product: byProduct.map(withProfit), by_day: byDay.map(withProfit) });
     }
     if (path === '/api/reports' && method === 'GET') {
       const today=new Date(),start=String(url.searchParams.get('startDate')??new Date(today.getFullYear(),today.getMonth(),1).toISOString().slice(0,10)),end=String(url.searchParams.get('endDate')??today.toISOString().slice(0,10)),from=`${start}T00:00:00.000Z`,to=`${end}T23:59:59.999Z`;

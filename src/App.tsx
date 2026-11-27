@@ -4,6 +4,7 @@ import {
   BarChart3,
   Boxes,
   CalendarClock,
+  TrendingUp,
   ChevronRight,
   LayoutDashboard,
   LogOut,
@@ -37,10 +38,11 @@ const SettingsView = lazyView(() => import('./components/SettingsView'), 'Settin
 const MenuView = lazyView(() => import('./components/MenuView'), 'MenuView');
 const PendingSalesView = lazyView(() => import('./components/PendingSalesView'), 'PendingSalesView');
 const LiteCustomersView = lazyView(() => import('./components/LiteCustomersView'), 'LiteCustomersView');
+const ProfitReportView = lazyView(() => import('./components/ProfitReportView'), 'ProfitReportView');
 const ReservationsView = lazyView(() => import('./components/ReservationsView'), 'ReservationsView');
 const QuickMonthlySalesView = lazyView(() => import('./components/QuickMonthlySalesView'), 'QuickMonthlySalesView');
 
-type AdminTab = 'dashboard' | 'pos' | 'catalog' | 'accounts' | 'inventory' | 'menu' | 'reports' | 'settings' | 'pending' | 'customers' | 'quick-report' | 'reservations';
+type AdminTab = 'dashboard' | 'pos' | 'catalog' | 'accounts' | 'inventory' | 'menu' | 'reports' | 'settings' | 'pending' | 'customers' | 'quick-report' | 'reservations' | 'profit';
 
 const DEFAULT_SETTINGS: StoreSettings = {
   id: 1,
@@ -89,12 +91,14 @@ const ADMIN_NAV: Array<{ id: AdminTab; label: string; icon: typeof LayoutDashboa
   { id: 'inventory', label: 'Estoque', icon: Boxes },
   { id: 'quick-report', label: 'Vendas do mês', icon: BarChart3 },
   { id: 'reservations', label: 'Reservas', icon: CalendarClock },
+  { id: 'profit', label: 'Lucro', icon: TrendingUp },
   { id: 'menu', label: 'Criar cardápio', icon: Utensils },
   { id: 'reports', label: 'Relatórios', icon: BarChart3 },
   { id: 'settings', label: 'Loja e Pix', icon: Settings },
 ];
 
 const TAB_TITLES: Record<AdminTab, { title: string; subtitle: string }> = {
+  profit: { title: 'Relatório de lucro', subtitle: 'Receita, custo e lucro por produto e por dia, com base no custo de compra do Estoque' },
   reservations: { title: 'Reservas e pedidos', subtitle: 'Pedidos feitos pela página pública, reservas abertas e ficha de produção' },
   pending: { title: 'Pendências', subtitle: 'Vendas em aberto por cliente' },
   'quick-report': { title: 'Vendas do mês', subtitle: 'Resumo rápido das vendas realizadas' },
@@ -261,7 +265,7 @@ export default function App() {
   };
 
   const lowStockCount = products.filter((p) => p.stock <= p.min_stock).length;
-  const isMoreTabActive = activeTab === 'catalog' || activeTab === 'menu' || activeTab === 'reports' || activeTab === 'settings' || activeTab === 'pending' || activeTab === 'customers' || activeTab === 'quick-report' || activeTab === 'reservations';
+  const isMoreTabActive = activeTab === 'catalog' || activeTab === 'menu' || activeTab === 'reports' || activeTab === 'settings' || activeTab === 'pending' || activeTab === 'customers' || activeTab === 'quick-report' || activeTab === 'reservations' || activeTab === 'profit';
   const visibleNav = storeType === 'lite' ? [{ id: 'pos' as const, label: 'PDV', icon: ShoppingCart }, { id: 'customers' as const, label: 'Clientes', icon: Users }, { id: 'inventory' as const, label: 'Estoque', icon: Boxes }, { id: 'pending' as const, label: 'Pendências', icon: Users }, { id: 'quick-report' as const, label: 'Relatório', icon: BarChart3 }] : ADMIN_NAV;
   const brandName = storeSettings.store_name || 'Tem o quê?';
   const brandStyle = createBrandStyle(storeSettings.brand_primary_color, storeSettings.brand_secondary_color);
@@ -416,7 +420,12 @@ export default function App() {
                 />
               )}
               {storeType === 'lite' && activeTab === 'pending' && <PendingSalesView onDataChanged={refreshAll} />}
-              {activeTab === 'quick-report' && <QuickMonthlySalesView storeType={storeType} />}
+              {activeTab === 'quick-report' && (
+                <div className="space-y-8">
+                  <QuickMonthlySalesView storeType={storeType} />
+                  {storeType === 'lite' && <div className="space-y-3"><h2 className="text-lg font-semibold text-slate-900">Lucro</h2><ProfitReportView /></div>}
+                </div>
+              )}
               {storeType === 'lite' && activeTab === 'customers' && <LiteCustomersView customers={employees} onDataChanged={refreshAll} />}
               {activeTab === 'pos' && (
                 <PosSalesView
@@ -451,6 +460,7 @@ export default function App() {
                   onDataChanged={refreshAll}
                 />
               )}
+              {storeType !== 'lite' && activeTab === 'profit' && <ProfitReportView />}
               {storeType !== 'lite' && activeTab === 'reservations' && <ReservationsView products={products} onDataChanged={refreshAll} />}
               {storeType !== 'lite' && activeTab === 'reports' && <ReportsView onOpenEmployeeAccount={handleOpenEmployeeAccount} />}
               {storeType !== 'lite' && activeTab === 'menu' && <MenuView products={products} settings={storeSettings} />}
@@ -545,6 +555,9 @@ export default function App() {
               </div>
 
               <div className="space-y-2">
+                <button onClick={() => { setActiveTab('profit'); setMoreSheetOpen(false); }} className="w-full rounded-2xl border border-slate-200 bg-white p-3.5 flex items-center justify-between gap-3 text-slate-800">
+                  <span className="flex items-center gap-3"><TrendingUp className="h-5 w-5 text-emerald-700"/><span className="text-left"><span className="block text-sm font-semibold">Relatório de lucro</span><span className="block text-xs text-slate-500">Receita, custo e lucro por produto</span></span></span><ChevronRight className="h-4 w-4 text-slate-400"/>
+                </button>
                 <button onClick={() => { setActiveTab('reservations'); setMoreSheetOpen(false); }} className="w-full rounded-2xl border border-slate-200 bg-white p-3.5 flex items-center justify-between gap-3 text-slate-800">
                   <span className="flex items-center gap-3"><CalendarClock className="h-5 w-5 text-emerald-700"/><span className="text-left"><span className="block text-sm font-semibold">Reservas e pedidos{(summary?.pending_orders ?? 0) > 0 ? ` (${summary?.pending_orders} em análise)` : ''}</span><span className="block text-xs text-slate-500">Pedidos da página pública e ficha de produção</span></span></span><ChevronRight className="h-4 w-4 text-slate-400"/>
                 </button>

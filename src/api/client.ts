@@ -10,6 +10,7 @@ import type {
   PeriodReport,
   PixKeyType,
   PriceHistoryEntry,
+  ProfitReport,
   ProductionRow,
   Product,
   ReservationOffer,
@@ -65,6 +66,8 @@ export async function request<T>(url: string, options?: RequestInit): Promise<T>
 }
 
 export const api = {
+  getProfitReport: (startDate: string, endDate: string, useCurrentCost: boolean) =>
+    request<ProfitReport>(`/api/profit-report?startDate=${encodeURIComponent(startDate)}&endDate=${encodeURIComponent(endDate)}${useCurrentCost ? '&useCurrentCost=1' : ''}`),
   getOffers: () => request<ReservationOffer[]>('/api/offers'),
   createOffer: (payload: { product_id: number; service_date?: string | null; limit_qty?: number | null; closes_at?: string | null }) =>
     request<ReservationOffer>('/api/offers', { method: 'POST', body: JSON.stringify(payload) }),
@@ -92,6 +95,7 @@ export const api = {
     category: string;
     image_url: string;
     price_cents: number;
+    cost_cents?: number | null;
     stock: number;
     min_stock: number;
     available: number;
@@ -104,6 +108,7 @@ export const api = {
       category: string;
       image_url: string;
       price_cents: number;
+      cost_cents?: number | null;
       min_stock: number;
       available: number;
       price_reason?: string;
@@ -115,7 +120,7 @@ export const api = {
 
   adjustStock: (
     productId: number,
-    payload: { type: 'entry' | 'adjustment'; quantity?: number; new_stock?: number; reason: string }
+    payload: { type: 'entry' | 'adjustment'; quantity?: number; new_stock?: number; reason: string; unit_cost_cents?: number | null }
   ) => request<Product>(`/api/products/${productId}/stock`, { method: 'POST', body: JSON.stringify(payload) }),
   getStockMovements: () => request<StockMovement[]>('/api/stock-movements'),
 

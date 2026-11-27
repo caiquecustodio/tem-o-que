@@ -53,3 +53,11 @@ export const CATEGORY_IMAGES: Record<string, string> = {
 /** Venda ainda não confirmada pelo servidor tem id negativo temporário. */
 export const isSyncedId = (id: number) => id > 0;
 export const saleRef = (id: number) => (id > 0 ? `#${id}` : 'Sincronizando');
+
+/** Campo de custo é opcional: vazio vira null (sem custo), nunca zero. */
+export function parseOptionalBRLToCents(input: string): number | null {
+  return input.trim() ? parseBRLToCents(input) : null;
+}
+export const centsToInput = (cents: number | null | undefined) => (cents === null || cents === undefined ? '' : (cents / 100).toFixed(2).replace('.', ','));
+/** Margem sobre o preço de venda, em %, ou null quando não dá para calcular. */
+export const marginPercent = (priceCents: number, costCents: number | null) => (costCents === null || priceCents <= 0 ? null : ((priceCents - costCents) / priceCents) * 100);
